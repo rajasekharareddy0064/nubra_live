@@ -1,0 +1,36 @@
+# Secrets & local auth (never commit)
+.env
+.env.*
+!.env.example
+auth_data.db
+auth_data.db.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs & local data
+*.log
+logs/
+
+# Large / regenerable instrument cache (refetch via SDK at runtime)
+instrument_master_cache.csv
+
+# Cursor / tooling
+.cursor/
