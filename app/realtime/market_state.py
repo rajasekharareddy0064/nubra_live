@@ -16,7 +16,7 @@ class MarketStateStore:
     options_by_strike: dict[int, dict[str, Any]] = field(default_factory=dict)
     option_chain_row: dict[str, Any] = field(default_factory=dict)
     last_option_totals: dict[str, float] = field(default_factory=dict)
-    # 15-row chain (7 ITM + 1 ATM + 7 OTM) reconstructed from
+    # ATM-centered option-chain view reconstructed from
     # ``options_by_strike`` by :class:`app.realtime.options_chain.OptionsChainBuilder`
     # on every NIFTY tick. Read by the 3-min scheduler and the
     # ``/realtime/candles/current`` REST endpoint.

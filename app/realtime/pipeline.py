@@ -19,6 +19,7 @@ from app.realtime.interval_clock import (
 )
 from app.realtime.market_state import MarketStateStore
 from app.realtime.option_summary import stock_futures_strength, summarize_options_for_interval
+from app.realtime.options_chain import STRIKE_RADIUS as OPTION_CHAIN_RADIUS
 from app.realtime.options_chain import OptionsChainBuilder
 
 if TYPE_CHECKING:
@@ -43,15 +44,58 @@ def _pick_num(payload: dict[str, Any], *keys: str) -> float:
     return _f(_pick(payload, *keys))
 
 
+def _coerce_option_value(raw: str) -> Any:
+    value = raw.strip()
+    if value == "None":
+        return None
+    if value in {"True", "False"}:
+        return value == "True"
+    try:
+        if any(ch in value for ch in (".", "e", "E")):
+            return float(value)
+        return int(value)
+    except ValueError:
+        return value.strip("'\"")
+
+
+def _option_row_from_repr(raw: Any) -> dict[str, Any] | None:
+    """Parse Nubra SDK rows rendered as ``OptionData(k=v, ...)`` strings."""
+    if isinstance(raw, dict):
+        return raw
+    if hasattr(raw, "__dict__"):
+        return {
+            key: value
+            for key, value in vars(raw).items()
+            if not key.startswith("_")
+        }
+    if not isinstance(raw, str):
+        return None
+
+    text = raw.strip()
+    if not text.startswith("OptionData(") or not text.endswith(")"):
+        return None
+
+    row: dict[str, Any] = {}
+    for key, value in re.findall(r"(\w+)=([^,)]*)", text):
+        row[key] = _coerce_option_value(value)
+    return row or None
+
+
 def _normalize_option_rows(raw: Any) -> list[dict[str, Any]]:
     if isinstance(raw, list):
-        return [x for x in raw if isinstance(x, dict)]
+        rows: list[dict[str, Any]] = []
+        for item in raw:
+            row = _option_row_from_repr(item)
+            if row is not None:
+                rows.append(row)
+        return rows
     if isinstance(raw, dict):
         rows: list[dict[str, Any]] = []
         for strike, data in raw.items():
-            if not isinstance(data, dict):
+            row = _option_row_from_repr(data)
+            if row is None:
                 continue
-            row = dict(data)
+            row = dict(row)
             row.setdefault("strike", strike)
             rows.append(row)
         return rows
@@ -162,7 +206,8 @@ class RealtimePipeline:
         self._prev_volume_by_symbol: dict[str, float] = {}
         self._candle_start_volume: dict[str, float] = {}
         self._missing_logged: set[str] = set()
-        # Throttled rebuilder for the 15-strike chain view + ML metrics.
+        self._last_option_chain_broadcast_builds = 0
+        # Throttled rebuilder for the ATM-centered chain view + ML metrics.
         # Reads from ``state.options_by_strike`` (mutated by per-ref
         # orderbook + greeks ticks) and writes to
         # ``state.option_chain_view`` / ``state.option_metrics`` so the
@@ -302,7 +347,42 @@ class RealtimePipeline:
         self.state.stock_futures_by_underlying[underlying] = under_state
 
     async def _emit_tick(self, channel: str, key: str, data: dict[str, Any]) -> None:
+        # Re-enable tick broadcasts on the websocket live stream.
         await self.hub.broadcast_json({"type": "tick", "channel": channel, "key": key, "data": data})
+
+    async def _refresh_option_chain(
+        self,
+        *,
+        force: bool = False,
+        emit: bool = False,
+        spot: float | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], int | None]:
+        spot = spot or self._last_nifty or self._initial_price
+        if not force and self.state.options_by_strike and not self.state.option_chain_view:
+            force = True
+        chain, metrics, atm = self._options_chain_builder.maybe_rebuild(
+            self.state.options_by_strike,
+            spot,
+            force=force,
+        )
+        self.state.option_chain_view = chain
+        self.state.option_metrics = metrics
+
+        builds = self._options_chain_builder.builds
+        if emit and builds > self._last_option_chain_broadcast_builds:
+            self._last_option_chain_broadcast_builds = builds
+            await self.hub.broadcast_json(
+                {
+                    "type": "option_chain",
+                    "spot": spot,
+                    "atm": atm,
+                    "strike_radius": OPTION_CHAIN_RADIUS,
+                    "chain": list(chain),
+                    "metrics": dict(metrics),
+                    "updated_at": time.time(),
+                }
+            )
+        return chain, metrics, atm
 
     async def _on_index(self, payload: dict[str, Any], normalized: dict[str, Any]) -> None:
         # Scale LTP to rupees once at the ingest edge so every
@@ -338,14 +418,10 @@ class RealtimePipeline:
                     self._ingestion.instrument_manager.update_atm(ltp)
                     self.refresh_ref_maps()
                     self._last_atm_update_ts = now_ts
-            # Refresh the 15-strike chain view + ML metrics on every
+            # Refresh the ATM-centered chain view + ML metrics on every
             # NIFTY tick. The builder internally throttles to 500ms
             # (or fires immediately on ATM rolls), so this is cheap.
-            chain, metrics, _ = self._options_chain_builder.maybe_rebuild(
-                self.state.options_by_strike, ltp
-            )
-            self.state.option_chain_view = chain
-            self.state.option_metrics = metrics
+            await self._refresh_option_chain(emit=True)
         # Nubra index stream also emits futures symbols; use it as primary for futures OI/volume.
         if is_futures:
             print("RAW STOCK MSG:", payload)
@@ -401,6 +477,7 @@ class RealtimePipeline:
 
         ce = _normalize_option_rows(_pick(core, "ce", "CE", "call", "calls", "call_data", "callData"))
         pe = _normalize_option_rows(_pick(core, "pe", "PE", "put", "puts", "put_data", "putData"))
+        atm_hint = self._to_rupees(_pick(core, "at_the_money_strike", "atm", "atm_strike", "atmStrike"))
         # Strike values from the chain stream are typically already in
         # the master's domain (paise); convert them to rupees so they
         # match keys written by _on_orderbook. LTPs are scaled too.
@@ -411,6 +488,24 @@ class RealtimePipeline:
                 return int(round(raw_strike / scale))
             return int(raw_strike)
 
+        def _chain_leg(row: dict[str, Any], existing: dict[str, Any] | None = None) -> dict[str, Any]:
+            leg = dict(existing or {})
+            leg.update(
+                {
+                    "ltp": self._to_rupees(_pick(row, "ltp", "last_traded_price", "lastTradedPrice", "last_price")),
+                    "oi": _pick(row, "open_interest", "openInterest", "oi"),
+                    "volume": _pick(row, "volume", "traded_volume", "tradedVolume"),
+                    "delta": _pick(row, "delta"),
+                    "gamma": _pick(row, "gamma"),
+                    "theta": _pick(row, "theta"),
+                    "vega": _pick(row, "vega"),
+                    "iv": _pick(row, "iv"),
+                    "ref_id": _pick(row, "ref_id", "refId", "refid"),
+                    "timestamp": _pick(row, "timestamp", "exchange_timestamp", "exchangeTimestamp", "time"),
+                }
+            )
+            return leg
+
         for row in ce:
             r = row or {}
             raw_strike = _f(_pick(r, "strike_price", "strikePrice", "strike", "strike_price_value"))
@@ -418,11 +513,7 @@ class RealtimePipeline:
             if strike <= 0:
                 continue
             bucket = self.state.options_by_strike.setdefault(strike, {})
-            bucket["CE"] = {
-                "ltp": self._to_rupees(_pick(r, "ltp", "last_traded_price", "lastTradedPrice", "last_price")),
-                "oi": _pick(r, "open_interest", "openInterest", "oi"),
-                "volume": _pick(r, "volume", "traded_volume", "tradedVolume"),
-            }
+            bucket["CE"] = _chain_leg(r, bucket.get("CE") if isinstance(bucket.get("CE"), dict) else None)
         for row in pe:
             r = row or {}
             raw_strike = _f(_pick(r, "strike_price", "strikePrice", "strike", "strike_price_value"))
@@ -430,15 +521,12 @@ class RealtimePipeline:
             if strike <= 0:
                 continue
             bucket = self.state.options_by_strike.setdefault(strike, {})
-            bucket["PE"] = {
-                "ltp": self._to_rupees(_pick(r, "ltp", "last_traded_price", "lastTradedPrice", "last_price")),
-                "oi": _pick(r, "open_interest", "openInterest", "oi"),
-                "volume": _pick(r, "volume", "traded_volume", "tradedVolume"),
-            }
+            bucket["PE"] = _chain_leg(r, bucket.get("PE") if isinstance(bucket.get("PE"), dict) else None)
         ce_oi = sum(_f(_pick((x or {}), "open_interest", "openInterest", "oi")) for x in ce)
         pe_oi = sum(_f(_pick((x or {}), "open_interest", "openInterest", "oi")) for x in pe)
         self.state.last_option_totals = {"ce_oi": ce_oi, "pe_oi": pe_oi}
         print("OPTIONS COUNT:", len(self.state.options_by_strike))
+        await self._refresh_option_chain(force=True, emit=True, spot=atm_hint if atm_hint > 0 else None)
         await self._emit_tick(
             "option",
             "chain",
@@ -537,11 +625,60 @@ class RealtimePipeline:
 
         if rid in fut_symbol_map:
             symbol = _norm_symbol(fut_symbol_map[rid] or normalized.get("symbol"))
-            # Futures aggregation uses index channel only; orderbook is passthrough.
+            if ltp > 0:
+                fut = dict(self.state.futures.get(symbol) or {})
+                fut.update(
+                    {
+                        "symbol": symbol,
+                        "ltp": ltp,
+                        "last_traded_price": ltp,
+                        "cum_volume": vol,
+                        "oi": ob.get("oi"),
+                        "timestamp": ob.get("timestamp"),
+                        "raw": normalized["raw"],
+                    }
+                )
+                fut_candle = self.candles.ensure_futures(symbol)
+                fut_add = self._volume_from_candle_start(symbol, vol, fut_candle)
+                fut_candle.update(ltp, fut_add, oi=ob.get("oi"), cum_volume=vol)
+                fut["volume"] = fut_candle.volume
+                self.state.futures[symbol] = fut
+                if symbol == self._primary_nifty_fut_symbol():
+                    self.state.nifty_futures = fut
+                    self.candles.nifty_futures.update(ltp, fut_add, oi=ob.get("oi"), cum_volume=vol)
+                self.logger.debug(
+                    "candle update orderbook kind=nifty_future rid=%s symbol=%s ltp=%s candle=%s",
+                    rid,
+                    symbol,
+                    ltp,
+                    fut_candle.to_dict(),
+                )
             await self._emit_tick("orderbook", f"NIFTY_FUT:{symbol}", ob)
         elif rid in stock_map:
-            sym = stock_map[rid]
-            # Stock futures aggregation uses index channel only; orderbook is passthrough.
+            sym = _norm_symbol(stock_map[rid])
+            if ltp > 0:
+                stock_candle = self.candles.ensure_stock(sym)
+                stock_add = self._volume_from_candle_start(sym, vol, stock_candle)
+                stock_candle.update(ltp, stock_add, oi=ob.get("oi"), cum_volume=vol)
+                self._merge_stock_state(
+                    sym,
+                    {
+                        "symbol": sym,
+                        "ltp": ltp,
+                        "volume": stock_candle.volume,
+                        "cum_volume": vol,
+                        "oi": ob.get("oi"),
+                        "timestamp": ob.get("timestamp"),
+                        "raw": normalized["raw"],
+                    },
+                )
+                self.logger.debug(
+                    "candle update orderbook kind=stock_future rid=%s symbol=%s ltp=%s candle=%s",
+                    rid,
+                    sym,
+                    ltp,
+                    stock_candle.to_dict(),
+                )
             await self._emit_tick("orderbook", f"STOCK_FUT:{sym}", ob)
         elif rid in opt_map:
             strike, side = opt_map[rid]
@@ -557,6 +694,7 @@ class RealtimePipeline:
                 "ref_id": rid,
             }
             print("OPTIONS COUNT:", len(self.state.options_by_strike))
+            await self._refresh_option_chain(emit=True)
             await self._emit_tick("option", opt_key, leg[opt_type])
         else:
             # rid == 0 means the payload had no ref_id field at all
@@ -643,6 +781,7 @@ class RealtimePipeline:
             )
             leg[opt_type] = cur
             print("OPTIONS COUNT:", len(self.state.options_by_strike))
+            await self._refresh_option_chain(emit=True)
             await self._emit_tick("option", opt_key, cur)
         await self._emit_tick("greeks", str(rid), core)
 
@@ -654,12 +793,24 @@ async def run_interval_scheduler(
     *,
     interval_minutes: int,
     tz_name: str,
+    debug_state: dict[str, Any] | None = None,
 ) -> None:
     tz = market_tz(tz_name)
     last_emitted_start: datetime | None = None
+    emitted_bucket_ids: set[str] = set()
     prev_totals: dict[str, float] = {}
     missing_logged: set[str] = set()
     log = logging.getLogger("realtime.scheduler")
+    if debug_state is not None:
+        debug_state.update(
+            {
+                "status": "starting",
+                "interval_minutes": interval_minutes,
+                "timezone": tz_name,
+                "emits_total": 0,
+                "last_error": None,
+            }
+        )
 
     def validate(symbol: str, candle: dict[str, Any]) -> None:
         if _f(candle.get("volume")) == 0:
@@ -671,122 +822,206 @@ async def run_interval_scheduler(
 
     while True:
         delay = seconds_until_next_boundary(datetime.now(tz), interval_minutes, tz)
+        if debug_state is not None:
+            now_for_debug = datetime.now(tz)
+            debug_state.update(
+                {
+                    "status": "sleeping",
+                    "now": now_for_debug.isoformat(),
+                    "seconds_until_next_emit": round(delay, 3),
+                    "next_emit_at": (now_for_debug + timedelta(seconds=delay)).isoformat(),
+                    "client_count": hub.client_count,
+                    "open_index": candle_board.nifty.to_dict(),
+                    "open_futures_count": len(candle_board.futures),
+                    "open_stocks_count": len(candle_board.stock_futures),
+                }
+            )
         await asyncio.sleep(delay)
-        now = datetime.now(tz)
-        # Bar that just closed at `now` (e.g. now=12:06:00 → [12:03, 12:06)).
-        bucket_start = closed_bucket_start(now, interval_minutes, tz)
-        bucket_end = bucket_start + timedelta(minutes=interval_minutes)
-        if last_emitted_start is not None and bucket_start == last_emitted_start:
-            log.warning("duplicate bucket skipped %s", bucket_start.isoformat())
-            continue
-        last_emitted_start = bucket_start
-
-        opt_sum = summarize_options_for_interval(state.option_chain_row, state.options_by_strike, prev_totals)
-        prev_totals["ce_oi"] = float(opt_sum.get("total_ce_oi") or 0)
-        prev_totals["pe_oi"] = float(opt_sum.get("total_pe_oi") or 0)
-
-        futures_candle_dicts = {k: v.to_dict() for k, v in candle_board.futures.items()}
-        stock_candle_dicts = {k: v.to_dict() for k, v in candle_board.stock_futures.items()}
-
-        # Annotate stock futures with their underlying ticker so
-        # downstream consumers can filter / join without parsing
-        # "ADANIENT26MAYFUT" themselves.
-        for sym, candle in stock_candle_dicts.items():
-            candle["underlying_symbol"] = _get_underlying(sym)
-        # Annotate NIFTY futures with their contract tag (current /
-        # next / far) so the UI can label them by tenor instead of
-        # parsing expiry months out of the symbol.
-        nifty_fut_contracts: dict[str, str] = {}
         try:
-            from app.main import APP_STATE  # late import: avoid cycle
+            if debug_state is not None:
+                debug_state.update({"status": "building", "last_error": None})
+            now = datetime.now(tz)
+            # Bar that just closed at `now` (e.g. now=12:06:00 → [12:03, 12:06)).
+            bucket_start = closed_bucket_start(now, interval_minutes, tz)
+            bucket_end = bucket_start + timedelta(minutes=interval_minutes)
+            bucket_id = f"{bucket_start.isoformat()}:{interval_minutes}m"
+            if bucket_id in emitted_bucket_ids or (
+                last_emitted_start is not None and bucket_start == last_emitted_start
+            ):
+                log.warning("duplicate candle bucket skipped bucket_id=%s", bucket_id)
+                if debug_state is not None:
+                    debug_state.update(
+                        {
+                            "status": "duplicate_skipped",
+                            "last_duplicate_bucket_id": bucket_id,
+                        }
+                    )
+                continue
+            last_emitted_start = bucket_start
+            emitted_bucket_ids.add(bucket_id)
+            if len(emitted_bucket_ids) > 128:
+                emitted_bucket_ids = set(list(emitted_bucket_ids)[-64:])
 
-            ingestion = APP_STATE.get("ingestion") if isinstance(APP_STATE, dict) else None
-            if ingestion is not None and getattr(ingestion, "instrument_manager", None) is not None:
-                manager = ingestion.instrument_manager
-                contract_by_ref = manager.get_nifty_fut_contracts()
-                symbol_by_ref = manager.get_nifty_fut_symbols()
-                for ref_id, label in contract_by_ref.items():
-                    sym = symbol_by_ref.get(ref_id)
-                    if sym:
-                        nifty_fut_contracts[sym] = label
-                        if sym in futures_candle_dicts:
-                            futures_candle_dicts[sym]["contract"] = label
-                            futures_candle_dicts[sym]["underlying_symbol"] = "NIFTY"
-        except Exception as exc:  # pragma: no cover — annotation failure must not break the bar
-            log.debug("could not annotate NIFTY future contracts: %s", exc)
+            opt_sum = summarize_options_for_interval(state.option_chain_row, state.options_by_strike, prev_totals)
+            try:
+                opt_sum = summarize_options_for_interval(state.option_chain_row, state.options_by_strike, prev_totals)
+            except Exception as exc:
+                log.exception("failed summarizing options for interval: %s", exc)
+                opt_sum = {}
+            prev_totals["ce_oi"] = float(opt_sum.get("total_ce_oi") or 0)
+            prev_totals["pe_oi"] = float(opt_sum.get("total_pe_oi") or 0)
 
-        strength = stock_futures_strength(state.stock_futures, stock_candle_dicts)
-        print("TOTAL STOCKS:", len(stock_candle_dicts))
-        for sym, candle in futures_candle_dicts.items():
-            validate(sym, candle)
-        for sym, candle in stock_candle_dicts.items():
-            validate(sym, candle)
-        # Coverage / OI diagnostics for required NIFTY list.
-        for s in sorted(NIFTY50_UNDERLYINGS):
-            if s not in state.stock_futures_by_underlying and s not in missing_logged:
-                print("Missing stock:", s)
-                missing_logged.add(s)
-        for s, d in sorted(state.stock_futures_by_underlying.items()):
-            if s in NIFTY50_UNDERLYINGS and not _f(d.get("oi")):
-                print("Missing OI:", s)
-            if s in NIFTY50_UNDERLYINGS and not _f(d.get("volume")):
-                print("WARNING: Volume not available for", s)
+            futures_candle_dicts = {k: v.to_dict() for k, v in candle_board.futures.items()}
+            stock_candle_dicts = {k: v.to_dict() for k, v in candle_board.stock_futures.items()}
 
-        log.info(
-            "emitting candle_3m | bucket_start=%s | /ws/live clients=%d",
-            bucket_start.isoformat(),
-            hub.client_count,
-        )
+            # Annotate stock futures with their underlying ticker so
+            # downstream consumers can filter / join without parsing
+            # "ADANIENT26MAYFUT" themselves.
+            for sym, candle in stock_candle_dicts.items():
+                candle["underlying_symbol"] = _get_underlying(sym)
+            # Annotate NIFTY futures with their contract tag (current /
+            # next / far) so the UI can label them by tenor instead of
+            # parsing expiry months out of the symbol.
+            nifty_fut_contracts: dict[str, str] = {}
+            try:
+                from app.main import APP_STATE  # late import: avoid cycle
 
-        msg: dict[str, Any] = {
-            "type": "candle_3m",
-            "bucket_start": bucket_start.isoformat(),
-            # bucket_end is the wall-clock at which this bar closed; many
-            # charting clients label 3m bars by close-time, so we expose
-            # both edges and let the consumer pick.
-            "bucket_end": bucket_end.isoformat(),
-            "interval_minutes": interval_minutes,
-            "futures": futures_candle_dicts,
-            "stocks": stock_candle_dicts,
-            "options": {
-                # 15-row chain (7 ITM + 1 ATM + 7 OTM) reconstructed
-                # from options_by_strike on every NIFTY tick by
-                # OptionsChainBuilder. Empty list until the first
-                # NIFTY index tick lands.
-                "chain": list(state.option_chain_view),
-                "metrics": dict(state.option_metrics),
-                # Legacy fields kept for backward compatibility with
-                # any consumers that already read them.
-                "summary": opt_sum,
-                "by_strike": {str(k): v for k, v in sorted(state.options_by_strike.items())},
-            },
-            "stock_futures_summary": strength,
-            "meta": {
-                "index": candle_board.nifty.to_dict(),
-                "high_liquid_symbols": sorted(HIGH_LIQUID),
-                # symbol -> "current" | "next" | "far" for whichever
-                # NIFTY monthly future contracts the master could
-                # resolve. Will be {} if the master cache is stale and
-                # only one expiry was found (see warning logged at
-                # boot in InstrumentManager._prepare_indices).
-                "nifty_fut_contracts": nifty_fut_contracts,
-            },
-        }
-        await hub.broadcast_json(msg)
-        candle_board.reset_all()
+                ingestion = APP_STATE.get("ingestion") if isinstance(APP_STATE, dict) else None
+                if ingestion is not None and getattr(ingestion, "instrument_manager", None) is not None:
+                    manager = ingestion.instrument_manager
+                    contract_by_ref = manager.get_nifty_fut_contracts()
+                    symbol_by_ref = manager.get_nifty_fut_symbols()
+                    for ref_id, label in contract_by_ref.items():
+                        sym = symbol_by_ref.get(ref_id)
+                        if sym:
+                            nifty_fut_contracts[sym] = label
+                            if sym in futures_candle_dicts:
+                                futures_candle_dicts[sym]["contract"] = label
+                                futures_candle_dicts[sym]["underlying_symbol"] = "NIFTY"
+            except Exception as exc:  # pragma: no cover — annotation failure must not break the bar
+                log.debug("could not annotate NIFTY future contracts: %s", exc)
 
-        # Immediately announce the new bar that has just opened so
-        # streaming consumers don't have to wait an entire interval to
-        # know e.g. "the 12:06 candle is now live". The OHLC fields are
-        # null at this moment — they will be filled in by ticks during
-        # the bucket and the closed snapshot will arrive at bucket_end.
-        new_bucket_start = bucket_end
-        new_bucket_end = new_bucket_start + timedelta(minutes=interval_minutes)
-        await hub.broadcast_json(
-            {
-                "type": "candle_3m_open",
-                "bucket_start": new_bucket_start.isoformat(),
-                "bucket_end": new_bucket_end.isoformat(),
+            strength = stock_futures_strength(state.stock_futures, stock_candle_dicts)
+            print("TOTAL STOCKS:", len(stock_candle_dicts))
+            for sym, candle in futures_candle_dicts.items():
+                validate(sym, candle)
+            for sym, candle in stock_candle_dicts.items():
+                validate(sym, candle)
+            # Coverage / OI diagnostics for required NIFTY list.
+            for s in sorted(NIFTY50_UNDERLYINGS):
+                if s not in state.stock_futures_by_underlying and s not in missing_logged:
+                    print("Missing stock:", s)
+                    missing_logged.add(s)
+            for s, d in sorted(state.stock_futures_by_underlying.items()):
+                if s in NIFTY50_UNDERLYINGS and not _f(d.get("oi")):
+                    print("Missing OI:", s)
+                if s in NIFTY50_UNDERLYINGS and not _f(d.get("volume")):
+                    print("WARNING: Volume not available for", s)
+
+            log.info(
+                "emit candle_3m bucket_id=%s index_ticks=%s futures=%d stocks=%d clients=%d",
+                bucket_id,
+                candle_board.nifty.tick_count,
+                len(futures_candle_dicts),
+                len(stock_candle_dicts),
+                hub.client_count,
+            )
+
+            msg: dict[str, Any] = {
+                "type": "candle_3m",
+                "bucket_id": bucket_id,
+                "bucket_start": bucket_start.isoformat(),
+                # bucket_end is the wall-clock at which this bar closed; many
+                # charting clients label 3m bars by close-time, so we expose
+                # both edges and let the consumer pick.
+                "bucket_end": bucket_end.isoformat(),
                 "interval_minutes": interval_minutes,
+                "futures": futures_candle_dicts,
+                "stocks": stock_candle_dicts,
+                "options": {
+                    # ATM-centered chain reconstructed
+                    # from options_by_strike on every NIFTY tick by
+                    # OptionsChainBuilder. Empty list until the first
+                    # NIFTY index tick lands.
+                    "chain": list(state.option_chain_view),
+                    "metrics": dict(state.option_metrics),
+                    # Legacy fields kept for backward compatibility with
+                    # any consumers that already read them.
+                    "summary": opt_sum,
+                    "by_strike": {str(k): v for k, v in sorted(state.options_by_strike.items())},
+                },
+                "stock_futures_summary": strength,
+                "is_empty": candle_board.nifty.tick_count == 0
+                and not futures_candle_dicts
+                and not stock_candle_dicts,
+                "meta": {
+                    "index": candle_board.nifty.to_dict(),
+                    "high_liquid_symbols": sorted(HIGH_LIQUID),
+                    # symbol -> "current" | "next" | "far" for whichever
+                    # NIFTY monthly future contracts the master could
+                    # resolve. Will be {} if the master cache is stale and
+                    # only one expiry was found (see warning logged at
+                    # boot in InstrumentManager._prepare_indices).
+                    "nifty_fut_contracts": nifty_fut_contracts,
+                },
             }
-        )
+            try:
+                await hub.broadcast_json(msg)
+            except Exception as exc:
+                log.exception("candle emit failed: %s", exc)
+                if debug_state is not None:
+                    debug_state.update(
+                        {
+                            "status": "broadcast_error",
+                            "last_error": repr(exc),
+                            "last_error_at": datetime.now(tz).isoformat(),
+                        }
+                    )
+                continue
+            if debug_state is not None:
+                debug_state.update(
+                    {
+                        "status": "emitted",
+                        "emits_total": int(debug_state.get("emits_total") or 0) + 1,
+                        "last_emit_at": datetime.now(tz).isoformat(),
+                        "last_bucket_start": bucket_start.isoformat(),
+                        "last_bucket_end": bucket_end.isoformat(),
+                        "last_bucket_id": bucket_id,
+                        "last_client_count": hub.client_count,
+                        "last_index": candle_board.nifty.to_dict(),
+                        "last_futures_count": len(futures_candle_dicts),
+                        "last_stocks_count": len(stock_candle_dicts),
+                    }
+                )
+            candle_board.reset_all()
+
+            # Immediately announce the new bar that has just opened so
+            # streaming consumers don't have to wait an entire interval to
+            # know e.g. "the 12:06 candle is now live". The OHLC fields are
+            # null at this moment — they will be filled in by ticks during
+            # the bucket and the closed snapshot will arrive at bucket_end.
+            new_bucket_start = bucket_end
+            new_bucket_end = new_bucket_start + timedelta(minutes=interval_minutes)
+            await hub.broadcast_json(
+                {
+                    "type": "candle_3m_open",
+                    "bucket_id": f"{new_bucket_start.isoformat()}:{interval_minutes}m",
+                    "bucket_start": new_bucket_start.isoformat(),
+                    "bucket_end": new_bucket_end.isoformat(),
+                    "interval_minutes": interval_minutes,
+                }
+            )
+        except asyncio.CancelledError:
+            if debug_state is not None:
+                debug_state.update({"status": "cancelled"})
+            raise
+        except Exception as exc:
+            if debug_state is not None:
+                debug_state.update(
+                    {
+                        "status": "error",
+                        "last_error": repr(exc),
+                        "last_error_at": datetime.now(tz).isoformat(),
+                    }
+                )
+            log.exception("candle interval scheduler iteration failed (will retry next boundary)")

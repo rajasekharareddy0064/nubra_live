@@ -19,6 +19,11 @@ def summarize_options_for_interval(
     Total CE vs PE OI, OI change vs previous interval, volume, PCR.
     Prefers full chain row if present; else aggregates per-strike maps.
     """
+    if not isinstance(option_chain_row, dict):
+        option_chain_row = {}
+    if not isinstance(options_by_strike, dict):
+        options_by_strike = {}
+
     ce_oi = 0.0
     pe_oi = 0.0
     ce_vol = 0.0
@@ -42,17 +47,32 @@ def summarize_options_for_interval(
         ce = [v for v in ce.values() if isinstance(v, dict)]
     if isinstance(pe, dict):
         pe = [v for v in pe.values() if isinstance(v, dict)]
+    if not isinstance(ce, list):
+        print("DEBUG option_summary bad ce type:", type(ce), ce)
+        ce = []
+    if not isinstance(pe, list):
+        print("DEBUG option_summary bad pe type:", type(pe), pe)
+        pe = []
     if ce or pe:
         for row in ce:
+            if not isinstance(row, dict):
+                print("DEBUG option_summary bad ce row type:", type(row), row)
+                continue
             r = row or {}
             ce_oi += _f(r.get("open_interest") or r.get("oi"))
             ce_vol += _f(r.get("volume"))
         for row in pe:
+            if not isinstance(row, dict):
+                print("DEBUG option_summary bad pe row type:", type(row), row)
+                continue
             r = row or {}
             pe_oi += _f(r.get("open_interest") or r.get("oi"))
             pe_vol += _f(r.get("volume"))
     else:
         for _strike, legs in options_by_strike.items():
+            if not isinstance(legs, dict):
+                print("DEBUG option_summary bad legs type:", type(legs), legs)
+                continue
             ce_d = legs.get("CE") or {}
             pe_d = legs.get("PE") or {}
             ce_oi += _f(ce_d.get("open_interest") or ce_d.get("oi"))

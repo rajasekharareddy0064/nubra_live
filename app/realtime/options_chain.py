@@ -1,7 +1,7 @@
 """
 Real-time NIFTY option-chain processor.
 
-Reconstructs a 15-strike option chain (7 ITM + 1 ATM + 7 OTM) from the
+Reconstructs an 11-strike option chain (5 ITM + 1 ATM + 5 OTM) from the
 ``options_by_strike`` dict that :class:`app.realtime.market_state.MarketStateStore`
 keeps populated by per-ref orderbook + greeks ticks. Computes the
 ML-friendly metrics used downstream (PCR, OI skew, max-OI strikes,
@@ -12,7 +12,7 @@ when the ATM strike rolls.
 Public surface (matches the spec in the project brief):
 
 * :func:`get_atm_strike` — round spot to the nearest 50.
-* :func:`get_strike_range` — 15 strikes around ATM.
+* :func:`get_strike_range` — 11 strikes around ATM.
 * :func:`build_option_chain` — reconstruct an ordered chain from
   ``options_by_strike``.
 * :func:`compute_option_metrics` — aggregate ML metrics over a chain.
@@ -33,10 +33,10 @@ Design notes
 * ``step`` is hard-coded to 50 (NIFTY's listed strike spacing). If
   Nubra ever switches the contract spec, change ``STRIKE_STEP`` here
   and in :class:`app.instruments.manager.InstrumentManager`.
-* Strike radius for the **chain view** (15) is intentionally narrower
+* Strike radius for the **chain view** (5) is intentionally narrower
   than the manager's **subscription radius** (default 15 → 31 strikes)
   — we subscribe to a wider window so we have data covering ATM
-  drift, but only present the 7±ATM±7 slice to consumers.
+  drift, but only present the ATM +/- 5 slice to consumers.
 """
 
 from __future__ import annotations
@@ -56,8 +56,8 @@ logger = logging.getLogger(__name__)
 STRIKE_STEP: int = 50
 
 #: How many strikes either side of ATM the chain view exposes.
-#: 7 → 7 ITM + 1 ATM + 7 OTM = 15 strikes.
-STRIKE_RADIUS: int = 7
+#: 5 -> 5 ITM + 1 ATM + 5 OTM = 11 strikes.
+STRIKE_RADIUS: int = 5
 
 #: Minimum interval between chain rebuilds when the ATM hasn't moved.
 #: Sub-second so the WebSocket / REST consumers see fresh OI as it

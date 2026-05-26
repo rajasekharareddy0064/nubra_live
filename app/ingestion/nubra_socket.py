@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from typing import Any, Optional
 
+from app.core.config import settings
 from app.core.env_loader import load_project_env
 from app.ingestion.auth_client import get_session_tokens
 from app.ingestion.auth_preflight import assert_auth_preflight, auth_preflight_status
@@ -35,7 +37,10 @@ class NubraIngestionService:
         strike_radius: int = 15,
         include_sdk_ohlcv: bool = False,
         include_sdk_option_chain: bool = True,
+        extra_brokers: Sequence[QueueBroker] | None = None,
     ) -> None:
+        extras = tuple(extra_brokers or ())
+        self._brokers: tuple[QueueBroker, ...] = (broker,) + extras
         self.broker = broker
         self.env_name = env_name
         self.exchange = exchange
@@ -161,12 +166,14 @@ class NubraIngestionService:
                 subs["greeks_ref_ids"], data_type="greeks", exchange=self.exchange
             )
         if subs["ohlcv_symbols"]:
+            ohlcv_iv = f"{int(settings.candle_interval_minutes)}m"
             await self.ws_manager.subscribe(
                 subs["ohlcv_symbols"],
                 data_type="ohlcv",
                 exchange=self.exchange,
-                interval="5m",
+                interval=ohlcv_iv,
             )
+            self.logger.info("Nubra ohlcv subscribe interval=%s (matches candle_interval_minutes)", ohlcv_iv)
 
         self.logger.info("Active subscription payloads: %s", subs)
 
@@ -227,7 +234,8 @@ class NubraIngestionService:
             stream=event.stream, key=event.key, payload=event.payload
         )
         try:
-            asyncio.create_task(self.broker.publish(envelope))
+            for b in self._brokers:
+                asyncio.create_task(b.publish(envelope))
         except RuntimeError:
             # Defensive: should not happen, on_tick is invoked on the loop.
             self.logger.exception("broker.publish could not be scheduled")

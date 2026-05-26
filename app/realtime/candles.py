@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Any
 
 
@@ -14,6 +13,7 @@ class OHLCV:
     volume: float = 0.0
     cum_volume: float = 0.0
     oi: float | None = None
+    tick_count: int = 0
 
     def update(
         self,
@@ -36,6 +36,7 @@ class OHLCV:
         if oi is not None:
             # OI is point-in-time (non-cumulative), keep latest value.
             self.oi = oi
+        self.tick_count += 1
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -46,6 +47,8 @@ class OHLCV:
             "volume": self.volume,
             "cum_volume": self.cum_volume,
             "oi": self.oi,
+            "tick_count": self.tick_count,
+            "is_empty": self.tick_count == 0,
         }
 
     def reset(self) -> None:
@@ -56,6 +59,7 @@ class OHLCV:
         self.volume = 0.0
         self.cum_volume = 0.0
         self.oi = None
+        self.tick_count = 0
 
 
 @dataclass

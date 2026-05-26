@@ -26,7 +26,7 @@ async def get_realtime_snapshot() -> dict:
     if ms is None:
         raise HTTPException(
             status_code=404,
-            detail="realtime snapshot only when running without DB (use_database=false)",
+            detail="market state store is not initialized on this server",
         )
     return ms.snapshot()  # type: ignore[no-any-return]
 
@@ -79,11 +79,7 @@ async def get_current_candles() -> dict:
     if candle_board is None:
         raise HTTPException(
             status_code=404,
-            detail=(
-                "in-memory candle board is only available in realtime mode "
-                "(use_database=false). With Postgres enabled, query "
-                "/candles/{symbol}/{interval} instead."
-            ),
+            detail="in-memory candle board is not initialized on this server",
         )
 
     interval_minutes = int(settings.candle_interval_minutes)
@@ -185,6 +181,47 @@ async def get_options_subscription() -> dict:
         return manager.get_option_subscription_payload(price)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"option subscription payload unavailable: {exc}") from exc
+
+
+@router.get("/debug/candle-scheduler")
+async def get_candle_scheduler_debug() -> dict:
+    from app.main import APP_STATE
+
+    scheduler = APP_STATE.get("candle_scheduler")
+    tasks = APP_STATE.get("tasks") or []
+    task_state = []
+    for task in tasks:
+        name = getattr(task, "get_name", lambda: "")()
+        if name == "Candle3mScheduler":
+            task_state.append(
+                {
+                    "name": name,
+                    "done": task.done(),
+                    "cancelled": task.cancelled(),
+                    "exception": repr(task.exception()) if task.done() and not task.cancelled() else None,
+                }
+            )
+
+    hub_debug = {}
+    hub = APP_STATE.get("hub")
+    if hub is not None and hasattr(hub, "debug_snapshot"):
+        hub_debug = hub.debug_snapshot()  # type: ignore[assignment, union-attr]
+
+    candles = APP_STATE.get("candles")
+    candle_debug = {}
+    if candles is not None:
+        candle_debug = {
+            "open_index": candles.nifty.to_dict(),  # type: ignore[union-attr]
+            "open_futures_count": len(candles.futures),  # type: ignore[union-attr]
+            "open_stocks_count": len(candles.stock_futures),  # type: ignore[union-attr]
+        }
+
+    return {
+        "scheduler": dict(scheduler) if isinstance(scheduler, dict) else {},
+        "tasks": task_state,
+        "hub": hub_debug,
+        "candles": candle_debug,
+    }
 
 
 @router.get("/health/ws")
