@@ -1,0 +1,71 @@
+# Cloud Run Job definition for auth-refresh
+# Deploy with:
+#   gcloud run jobs replace deploy_auth_job.yaml --project=stock-anaysis --region=asia-south1
+#
+# Or use: gcloud run jobs create/update (see deploy commands below)
+
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: nubra-auth-refresh
+  labels:
+    app: nubra-live
+    component: auth-refresh
+  annotations:
+    run.googleapis.com/launch-stage: GA
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/execution-environment: gen2
+    spec:
+      template:
+        spec:
+          containers:
+            - image: gcr.io/stock-anaysis/nubra-live:latest
+              command: ["python"]
+              args: ["jobs/auth_refresh.py"]
+              resources:
+                limits:
+                  memory: "512Mi"
+                  cpu: "1"
+              env:
+                - name: NUBRA_ENV
+                  value: "PROD"
+                - name: GCP_PROJECT_ID
+                  value: "stock-anaysis"
+                - name: LOG_LEVEL
+                  value: "INFO"
+                - name: NUBRA_AUTH_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: nubra-auth-token
+                      key: latest
+                - name: NUBRA_X_DEVICE_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: nubra-x-device-id
+                      key: latest
+                - name: NUBRA_SESSION_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: nubra-session-token
+                      key: latest
+                - name: PHONE_NO
+                  valueFrom:
+                    secretKeyRef:
+                      name: PHONE_NO
+                      key: latest
+                - name: MPIN
+                  valueFrom:
+                    secretKeyRef:
+                      name: MPIN
+                      key: latest
+                - name: NUBRA_TOTP_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: NUBRA_TOTP_SECRET
+                      key: latest
+          maxRetries: 2
+          timeoutSeconds: 300
+          serviceAccountName: 791197716058-compute@developer.gserviceaccount.com

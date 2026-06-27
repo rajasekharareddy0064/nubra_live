@@ -288,8 +288,8 @@ def update_candle_options(
     """Stamp ``chain`` + ``metrics`` into ``candle_3m["options"]``.
 
     Mutates ``candle_3m`` in place **and** returns it so the call can
-    be chained. Existing keys under ``options`` (e.g. ``summary``,
-    ``by_strike`` from older code paths) are preserved.
+    be chained. Existing keys under ``options`` such as ``summary`` are
+    preserved.
     """
     options = candle_3m.setdefault("options", {})
     options["chain"] = chain

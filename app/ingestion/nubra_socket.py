@@ -56,6 +56,7 @@ class NubraIngestionService:
         self.auth_status: dict[str, Any] = {}
         self.last_start_phase: str = "init"
         self._sampled_option_logs = 0
+        self._sampled_orderbook_logs = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -111,6 +112,11 @@ class NubraIngestionService:
         if self.ws_manager is not None:
             await self.ws_manager.stop()
             self.ws_manager = None
+
+    async def reconnect_websocket(self) -> None:
+        if self.ws_manager is None:
+            return
+        await self.ws_manager.reconnect_for_session_refresh()
 
     # ------------------------------------------------------------------
     # Health
@@ -175,6 +181,9 @@ class NubraIngestionService:
             )
             self.logger.info("Nubra ohlcv subscribe interval=%s (matches candle_interval_minutes)", ohlcv_iv)
 
+        total_symbols = sum(len(values) for values in subs.values())
+        self.logger.info("SUBSCRIBED_%d_SYMBOLS", total_symbols)
+        self.logger.info("SUBSCRIBED")
         self.logger.info("Active subscription payloads: %s", subs)
 
     def _on_option_tokens_changed(self, diff: Any) -> None:
@@ -228,6 +237,13 @@ class NubraIngestionService:
             self._sampled_option_logs += 1
             self.logger.info(
                 "option payload sample keys=%s", sorted(event.payload.keys())
+            )
+        if event.stream == "orderbook" and self._sampled_orderbook_logs < 5:
+            self._sampled_orderbook_logs += 1
+            self.logger.info(
+                "orderbook payload sample key=%s keys=%s",
+                event.key,
+                sorted(event.payload.keys()),
             )
 
         envelope = EventEnvelope(

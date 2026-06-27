@@ -241,3 +241,86 @@ async def get_ws_health() -> dict:
     if health_fn is None:
         raise HTTPException(status_code=500, detail="ingestion does not expose health()")
     return health_fn()
+
+
+@router.post("/admin/shutdown")
+async def admin_shutdown() -> dict:
+    """Graceful shutdown: disconnect WS, flush DB, stop aggregation.
+
+    Called by the market_stop Cloud Run Job before scaling to zero.
+    Does not terminate the process — Cloud Run handles that when
+    min-instances drops to 0 and there's no traffic.
+    """
+    import logging
+    from app.main import APP_STATE
+
+    logger = logging.getLogger("admin.shutdown")
+    logger.info("ADMIN_SHUTDOWN_REQUESTED | reason=market_close")
+
+    results = {}
+
+    # 1. Stop ingestion (closes WebSocket)
+    ingestion = APP_STATE.get("ingestion")
+    if ingestion is not None:
+        try:
+            await ingestion.stop()
+            results["websocket"] = "disconnected"
+            logger.info("WEBSOCKET_DISCONNECTED | ingestion stopped")
+        except Exception as exc:
+            results["websocket"] = f"error: {exc}"
+            logger.warning("WEBSOCKET_DISCONNECT_FAILED | %s", exc)
+    else:
+        results["websocket"] = "not_running"
+
+    # 2. Flush database writer
+    db_writer = APP_STATE.get("db_writer")
+    if db_writer is not None and hasattr(db_writer, "flush"):
+        try:
+            await db_writer.flush()
+            results["db_flush"] = "complete"
+            logger.info("DB_FLUSH_COMPLETE | pending writes flushed")
+        except Exception as exc:
+            results["db_flush"] = f"error: {exc}"
+            logger.warning("DB_FLUSH_FAILED | %s", exc)
+    else:
+        results["db_flush"] = "not_applicable"
+
+    # 3. Cancel background tasks (aggregation, scheduler)
+    tasks = APP_STATE.get("tasks", [])
+    cancelled = 0
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+            cancelled += 1
+    results["tasks_cancelled"] = cancelled
+    logger.info("TASKS_CANCELLED | count=%d", cancelled)
+
+    APP_STATE["shutdown_requested"] = True
+    logger.info("ADMIN_SHUTDOWN_COMPLETE | results=%s", results)
+    return {"status": "shutdown_initiated", "details": results}
+
+
+@router.get("/health/ingestion")
+async def get_ingestion_health() -> dict:
+    """Ingestion health with simulation mode support."""
+    from app.main import APP_STATE
+    from app.core.config import settings
+
+    if settings.is_simulation:
+        stats = APP_STATE.get("simulation_stats")
+        if stats is None:
+            return {"mode": "SIMULATION", "status": "STARTING"}
+        if hasattr(stats, "to_dict"):
+            return stats.to_dict()
+        return {"mode": "SIMULATION", "status": "UNKNOWN"}
+
+    ingestion = APP_STATE.get("ingestion")
+    if ingestion is None:
+        return {"mode": "LIVE", "status": "NOT_STARTED", "socket": "uninitialised"}
+
+    health_fn = getattr(ingestion, "health", None)
+    if health_fn is None:
+        return {"mode": "LIVE", "status": "NO_HEALTH_FN"}
+
+    ws_health = health_fn()
+    return {"mode": "LIVE", "status": "RUNNING", **ws_health}

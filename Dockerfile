@@ -7,6 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONPATH=/app \
+    NUBRA_AUTH_DIR=/tmp/auth \
     TZ=Asia/Kolkata
 
 WORKDIR /app
@@ -29,15 +30,18 @@ RUN pip install --upgrade pip \
 
 # Copy app (instrument master CSV is optional; mount or let InstrumentManager fetch)
 COPY app ./app
+COPY jobs ./jobs
+COPY bootstrap_auth.py ./bootstrap_auth.py
 
 # Non-root user
 RUN useradd --create-home --shell /bin/bash appuser \
-    && chown -R appuser:appuser /app
+    && mkdir -p /tmp/auth \
+    && chown -R appuser:appuser /app /tmp/auth
 USER appuser
 
-EXPOSE 8000
+EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD curl -fsS http://localhost:8000/health || exit 1
+  CMD curl -fsS http://localhost:${PORT:-8080}/health || exit 1
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080}"]

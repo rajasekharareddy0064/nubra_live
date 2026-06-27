@@ -59,10 +59,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import json
 import logging
 import os
 import re
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -82,6 +84,8 @@ __all__ = [
     "reset_cached_client",
     "get_session_tokens",
     "bootstrap_session_from_env",
+    "ensure_auth_dir",
+    "session_is_expired",
 ]
 
 
@@ -91,7 +95,8 @@ __all__ = [
 
 _AUTH_DB_PREFIX = "auth_data.db"
 _AUTH_DB_EXTS = ("dat", "bak", "dir")
-DEFAULT_REFRESH_LOOP_INTERVAL_SECONDS = 30 * 60
+DEFAULT_AUTH_DIR = Path("/tmp/auth")
+DEFAULT_REFRESH_LOOP_INTERVAL_SECONDS = 5 * 60
 
 #: Match server / SDK error strings that mean the device-id is unknown
 #: to the server's TOTP roster (re-enrolment required).
@@ -138,13 +143,34 @@ def _is_jwt_expired(token: Optional[str], leeway_seconds: int = 30) -> bool:
         return True
 
 
-def _shelve_path(base_dir: str | Path = ".") -> str:
-    return str(Path(base_dir) / _AUTH_DB_PREFIX)
+def _auth_dir(base_dir: str | Path | None = None) -> Path:
+    return Path(base_dir or os.getenv("NUBRA_AUTH_DIR") or DEFAULT_AUTH_DIR).resolve()
 
 
-def _shelve_exists(base_dir: str | Path = ".") -> bool:
-    base = Path(base_dir)
+def ensure_auth_dir(base_dir: str | Path | None = None) -> Path:
+    path = _auth_dir(base_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _shelve_path(base_dir: str | Path | None = None) -> str:
+    return str(_auth_dir(base_dir) / _AUTH_DB_PREFIX)
+
+
+def _shelve_exists(base_dir: str | Path | None = None) -> bool:
+    base = _auth_dir(base_dir)
     return any((base / f"{_AUTH_DB_PREFIX}.{ext}").exists() for ext in _AUTH_DB_EXTS)
+
+
+@contextlib.contextmanager
+def _sdk_auth_workdir(base_dir: str | Path | None = None):
+    target = ensure_auth_dir(base_dir)
+    original = Path.cwd()
+    os.chdir(target)
+    try:
+        yield target
+    finally:
+        os.chdir(original)
 
 
 def _resolve_env_enum(env_name: str) -> Any:
@@ -164,7 +190,7 @@ def _resolve_env_enum(env_name: str) -> Any:
     return enum_value
 
 
-def _load_session_from_shelve(base_dir: str | Path = ".") -> dict[str, Optional[str]]:
+def _load_session_from_shelve(base_dir: str | Path | None = None) -> dict[str, Optional[str]]:
     if not _shelve_exists(base_dir):
         return {"auth_token": None, "session_token": None, "x_device_id": None}
     try:
@@ -178,8 +204,39 @@ def _load_session_from_shelve(base_dir: str | Path = ".") -> dict[str, Optional[
             }
     except Exception as exc:  # noqa: BLE001
         raise NubraAuthError(
-            f"Failed to read auth_data.db.* shelve in {Path(base_dir).resolve()}: {exc}"
+            f"Failed to read auth_data.db.* shelve in {_auth_dir(base_dir)}: {exc}"
         ) from exc
+
+
+def _write_auth_shelve(
+    base_dir: str | Path | None,
+    values: dict[str, Optional[str]],
+) -> None:
+    import dbm.dumb
+    import shelve
+
+    base = ensure_auth_dir(base_dir)
+    with shelve.Shelf(dbm.dumb.open(str(base / _AUTH_DB_PREFIX), "n"), writeback=True) as db:
+        for key, value in values.items():
+            if value:
+                db[key] = value
+        db.sync()
+    bak = base / f"{_AUTH_DB_PREFIX}.bak"
+    dir_file = base / f"{_AUTH_DB_PREFIX}.dir"
+    if dir_file.exists() and not bak.exists():
+        shutil.copyfile(dir_file, bak)
+
+
+def _persist_client_tokens(base_dir: str | Path | None, client: Any) -> None:
+    tokens = get_session_tokens(client)
+    _write_auth_shelve(
+        base_dir,
+        {
+            "auth_token": tokens.get("auth_token"),
+            "session_token": tokens.get("session_token"),
+            "x-device-id": tokens.get("x_device_id"),
+        },
+    )
 
 
 def get_session_tokens(client: Any) -> dict[str, Optional[str]]:
@@ -197,7 +254,7 @@ def get_session_tokens(client: Any) -> dict[str, Optional[str]]:
     }
 
 
-def _prune_stale_bearers(base_dir: str | Path = ".") -> bool:
+def _prune_stale_bearers(base_dir: str | Path | None = None) -> bool:
     """Remove expired ``auth_token`` / ``session_token`` from the shelve.
 
     The ``x-device-id`` is **always** preserved. Returns ``True`` if
@@ -216,7 +273,7 @@ def _prune_stale_bearers(base_dir: str | Path = ".") -> bool:
     """
     if not _shelve_exists(base_dir):
         return False
-    base = Path(base_dir)
+    base = _auth_dir(base_dir)
     try:
         import shelve
 
@@ -245,7 +302,7 @@ def _prune_stale_bearers(base_dir: str | Path = ".") -> bool:
         return False
 
 
-def bootstrap_session_from_env(base_dir: str | Path = ".") -> bool:
+def bootstrap_session_from_env(base_dir: str | Path | None = None) -> bool:
     """Pre-write the SDK's shelve from env vars.
 
     Writes ``auth_data.db.*`` from ``NUBRA_AUTH_TOKEN`` /
@@ -256,7 +313,7 @@ def bootstrap_session_from_env(base_dir: str | Path = ".") -> bool:
 
     Returns ``True`` if the shelve was (re-)written.
     """
-    base = Path(base_dir)
+    base = ensure_auth_dir(base_dir)
 
     auth_token = (os.getenv("NUBRA_AUTH_TOKEN") or os.getenv("AUTH_TOKEN") or "").strip()
     x_device_id = (os.getenv("NUBRA_X_DEVICE_ID") or os.getenv("X_DEVICE_ID") or "").strip()
@@ -264,13 +321,22 @@ def bootstrap_session_from_env(base_dir: str | Path = ".") -> bool:
         os.getenv("NUBRA_SESSION_TOKEN") or os.getenv("SESSION_TOKEN") or ""
     ).strip()
 
-    if not x_device_id or not auth_token or not session_token:
+    if not x_device_id and not auth_token and not session_token:
         return False
-    if _is_jwt_expired(session_token):
+
+    if session_token and _is_jwt_expired(session_token):
         logger.warning(
-            "NUBRA_SESSION_TOKEN in env is expired; not writing it to "
-            "auth_data.db. Refresh it via setup_totp.py / enroll_totp.py."
+            "SESSION_EXPIRED | NUBRA_SESSION_TOKEN expired — seeding "
+            "x-device-id only to preserve enrolled device binding for TOTP login"
         )
+        # Still seed device-id so TOTP login reuses the enrolled device.
+        # Without this, SDK generates a fresh UUID → server says "TOTP is not enabled".
+        if x_device_id:
+            _write_auth_shelve(base, {"x-device-id": x_device_id})
+            logger.info("DEVICE_ID_SEEDED | x_device_id=%s", _short(x_device_id))
+        return False
+
+    if not x_device_id or not auth_token or not session_token:
         return False
 
     has_files = any((base / f"{_AUTH_DB_PREFIX}.{ext}").exists() for ext in _AUTH_DB_EXTS)
@@ -293,13 +359,14 @@ def bootstrap_session_from_env(base_dir: str | Path = ".") -> bool:
         return False
 
     try:
-        import shelve
-
-        with shelve.open(str(base / _AUTH_DB_PREFIX), flag="c", writeback=True) as db:
-            db["auth_token"] = auth_token
-            db["x-device-id"] = x_device_id
-            db["session_token"] = session_token
-            db.sync()
+        _write_auth_shelve(
+            base,
+            {
+                "auth_token": auth_token,
+                "x-device-id": x_device_id,
+                "session_token": session_token,
+            },
+        )
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to bootstrap auth_data.db from env: %s", exc)
         return False
@@ -318,6 +385,19 @@ def reset_cached_client() -> None:
     global _cached_client
     with _client_lock:
         _cached_client = None
+
+
+def session_is_expired(*, base_dir: str | Path | None = None) -> bool:
+    """Return True when the on-disk session is missing, incomplete, or expired."""
+    try:
+        tokens = _load_session_from_shelve(base_dir)
+    except NubraAuthError:
+        return True
+    return (
+        not tokens.get("auth_token")
+        or not tokens.get("x_device_id")
+        or _is_jwt_expired(tokens.get("session_token"))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +459,10 @@ def _ensure_nubra_ref_master_if_empty(client: Any) -> None:
         )
 
 
-def _try_build_session_only_client(env_name: str) -> Optional[Any]:
+def _try_build_session_only_client(
+    env_name: str,
+    base_dir: str | Path | None = None,
+) -> Optional[Any]:
     """Construct the SDK from cached tokens without any HTTP.
 
     Returns ``None`` (not raises) when the shelve is missing /
@@ -387,11 +470,11 @@ def _try_build_session_only_client(env_name: str) -> Optional[Any]:
     refresh path. Genuinely unexpected errors (e.g. shelve corrupted)
     still raise :class:`NubraAuthError`.
     """
-    if not _shelve_exists("."):
+    if not _shelve_exists(base_dir):
         logger.info("auth_data.db.* not present — falling through to TOTP login")
         return None
 
-    tokens = _load_session_from_shelve(".")
+    tokens = _load_session_from_shelve(base_dir)
     auth_token = tokens.get("auth_token")
     session_token = tokens.get("session_token")
     x_device_id = tokens.get("x_device_id")
@@ -490,7 +573,10 @@ def _classify_login_failure(captured: str, exc: BaseException) -> str:
     return ""
 
 
-def _build_via_totp_login(env_name: str) -> Any:
+def _build_via_totp_login(
+    env_name: str,
+    base_dir: str | Path | None = None,
+) -> Any:
     """Run the SDK login flow with the patched input injecting TOTP.
 
     Captures stdout for diagnostics, prunes stale bearers first to
@@ -531,7 +617,7 @@ def _build_via_totp_login(env_name: str) -> Any:
         ) from exc
 
     # Protect the registered x-device-id from the SDK's reset_tokens().
-    _prune_stale_bearers(".")
+    _prune_stale_bearers(base_dir)
 
     from nubra_python_sdk.start_sdk import InitNubraSdk
 
@@ -548,7 +634,7 @@ def _build_via_totp_login(env_name: str) -> Any:
 
     captured = io.StringIO()
     try:
-        with contextlib.redirect_stdout(captured):
+        with _sdk_auth_workdir(base_dir), contextlib.redirect_stdout(captured):
             client = InitNubraSdk(
                 env=env_enum,
                 totp_login=True,
@@ -580,6 +666,8 @@ def _build_via_totp_login(env_name: str) -> Any:
             "TOTP login completed but the returned session_token is "
             "already expired — likely host clock drift."
         )
+
+    _persist_client_tokens(base_dir, client)
 
     logger.info(
         "Session refresh successful | env=%s | x_device_id=%s | "
@@ -621,6 +709,7 @@ def get_authenticated_client(
     global _cached_client
 
     with _client_lock:
+        auth_dir = ensure_auth_dir()
         if _cached_client is not None and not force_refresh:
             tokens = get_session_tokens(_cached_client)
             if not _is_jwt_expired(tokens.get("session_token")):
@@ -636,15 +725,15 @@ def get_authenticated_client(
         load_project_env(".")
 
         # Allow ops to seed the shelve from env vars before we read it.
-        bootstrap_session_from_env(".")
+        bootstrap_session_from_env(auth_dir)
 
         # 1) Fast path: cached session is still valid.
-        client = _try_build_session_only_client(env_name=env_name)
+        client = _try_build_session_only_client(env_name=env_name, base_dir=auth_dir)
         source = "auth_data.db.*"
 
         # 2) Slow path: TOTP login with patched input.
         if client is None:
-            client = _build_via_totp_login(env_name=env_name)
+            client = _build_via_totp_login(env_name=env_name, base_dir=auth_dir)
             source = "totp-login"
 
         _ensure_nubra_ref_master_if_empty(client)
@@ -679,6 +768,7 @@ async def run_session_refresh_loop(
     *,
     env_name: str = "UAT",
     interval_seconds: float = DEFAULT_REFRESH_LOOP_INTERVAL_SECONDS,
+    on_refresh: Optional[Any] = None,
     **_legacy_kwargs: Any,
 ) -> None:
     """Periodically re-validate the cached session.
@@ -702,7 +792,14 @@ async def run_session_refresh_loop(
     while True:
         try:
             await asyncio.sleep(interval_seconds)
+            if not session_is_expired():
+                continue
             await asyncio.to_thread(ensure_session_fresh, env_name=env_name)
+            logger.info("SESSION_REFRESHED")
+            if on_refresh is not None:
+                result = on_refresh()
+                if asyncio.iscoroutine(result):
+                    await result
         except asyncio.CancelledError:
             logger.info("Nubra session refresh loop cancelled")
             raise

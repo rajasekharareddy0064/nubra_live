@@ -4,20 +4,19 @@ from contextlib import asynccontextmanager
 from typing import Any, Awaitable
 
 from fastapi import FastAPI
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 from app.api.routes import router as rest_router
 from app.api.ws import router as ws_router
 from app.core.config import settings
 from app.core.env_loader import load_project_env
 from app.core.logging import setup_logging
+from bootstrap_auth import bootstrap_auth
 
 # --- Non-interactive bootstrap ----------------------------------------------
 # Must run before any module imports nubra_python_sdk transitively.
-from app.ingestion.input_patch import install_non_interactive_input_patch
 
 load_project_env(".")
-install_non_interactive_input_patch(require_totp_secret=False)
 # ---------------------------------------------------------------------------
 
 from app.ingestion.auth_client import run_session_refresh_loop
@@ -83,7 +82,10 @@ async def _start_nubra_background(
         logger.exception("Nubra ingestion startup failed")
         return
 
-    await run_session_refresh_loop(env_name=env_name)
+    await run_session_refresh_loop(
+        env_name=env_name,
+        on_refresh=ingestion.reconnect_websocket,
+    )
 
 
 async def _start_database_background(
@@ -97,7 +99,7 @@ async def _start_database_background(
     APP_STATE["database_status"] = {"state": "connecting", "error": None}
     try:
         logger.info("background db connect begin")
-        await asyncio.wait_for(db_writer.connect(), timeout=15.0)
+        await asyncio.wait_for(db_writer.connect(), timeout=120.0)
         APP_STATE["database_status"] = {"state": "ready", "error": None}
         logger.info("background db connect complete")
 
@@ -149,11 +151,15 @@ async def lifespan(_: FastAPI):
     from app.realtime.candles import CandleBoard
     from app.realtime.hub import LiveHub
     from app.realtime.market_state import MarketStateStore
+    from app.realtime.nifty_ohlc import NiftyOhlcAggregator
+    from app.realtime.order_book import OrderBookAggregator
     from app.realtime.pipeline import RealtimePipeline, run_interval_scheduler
 
     hub = LiveHub()
     candles = CandleBoard()
     market_state = MarketStateStore()
+    nifty_ohlc_aggregator = NiftyOhlcAggregator()
+    order_book_aggregator = OrderBookAggregator()
 
     APP_STATE.clear()
     APP_STATE.update(
@@ -163,57 +169,109 @@ async def lifespan(_: FastAPI):
             "hub": hub,
             "market_state": market_state,
             "candles": candles,
+            "nifty_ohlc_aggregator": nifty_ohlc_aggregator,
+            "order_book_aggregator": order_book_aggregator,
             "candle_scheduler": {},
             "startup_mode": "database" if settings.use_database else "realtime",
         }
     )
 
     realtime_broker = broker
+    db_writer: DBWriter | None = None
+    database_task_kwargs: dict[str, Any] | None = None
     if settings.use_database:
         realtime_broker = QueueBroker(maxsize=settings.queue_maxsize)
         db_writer = DBWriter(
-            dsn=settings.postgres_dsn,
+            dsn=settings.database_dsn,
             batch_size=settings.db_batch_size,
             flush_interval_ms=settings.db_flush_interval_ms,
+            schema=settings.db_schema,
         )
         APP_STATE["db_writer"] = db_writer
         APP_STATE["database_status"] = {"state": "scheduled", "error": None}
-        _track_task(
-            tasks,
-            _start_database_background(
-                broker=broker,
-                redis_store=redis_store,
-                db_writer=db_writer,
-                logger=logger,
-            ),
-            name="DatabaseRuntime",
-            logger=logger,
-        )
+        database_task_kwargs = {
+            "broker": broker,
+            "redis_store": redis_store,
+            "db_writer": db_writer,
+            "logger": logger,
+        }
 
     ingestion: NubraIngestionService | None = None
-    if settings.enable_nubra_socket:
-        ingestion = NubraIngestionService(
-            broker=broker,
-            env_name=settings.nubra_env,
-            exchange=settings.nubra_exchange,
-            initial_nifty_price=settings.initial_nifty_price,
-            strike_radius=settings.strike_radius,
-            include_sdk_ohlcv=settings.subscribe_sdk_ohlcv,
-            include_sdk_option_chain=settings.subscribe_sdk_option_chain,
-            extra_brokers=(realtime_broker,) if settings.use_database else None,
+    if settings.is_simulation:
+        # ── SIMULATION MODE ──────────────────────────────────────────
+        # Replace live WebSocket with sample data replay.
+        # The downstream pipeline (broker -> candles -> hub -> db) is identical.
+        from app.simulation.simulator import MarketSimulator, SimulationStats
+
+        APP_STATE["ingestion_status"] = {"state": "simulation", "error": None}
+        APP_STATE["simulation_stats"] = SimulationStats()
+        logger.info(
+            "SIMULATION_MODE | speed=%sx data_dir=%s",
+            settings.simulation_speed,
+            settings.sample_data_dir,
         )
-        APP_STATE["ingestion"] = ingestion
+
+        simulator = MarketSimulator(
+            broker=broker,
+            speed=settings.simulation_speed,
+            data_dir=settings.sample_data_dir,
+        )
+        APP_STATE["simulator"] = simulator
+
+        async def _run_simulation() -> None:
+            stats = await simulator.run()
+            APP_STATE["simulation_stats"] = stats
+            APP_STATE["ingestion_status"] = {
+                "state": "simulation_complete",
+                "error": None,
+                "stats": stats.to_dict(),
+            }
+
+        _track_task(tasks, _run_simulation(), name="MarketSimulator", logger=logger)
+
+    elif settings.enable_nubra_socket:
+        # Auth bootstrap + ingestion startup are moved to a background task so
+        # a failed / expired session does NOT crash the container at startup.
+        # The API stays healthy; /health/ready exposes the auth state.
+        APP_STATE["auth"] = {"auth_dir": None, "regenerated": False}
         APP_STATE["ingestion_status"] = {"state": "scheduled", "error": None}
-        _track_task(
-            tasks,
-            _start_nubra_background(
-                ingestion,
+
+        async def _boot_ingestion() -> None:
+            """Bootstrap auth then start ingestion — all in background."""
+            try:
+                auth_result = await bootstrap_auth(env_name=settings.nubra_env)
+                APP_STATE["auth"] = {
+                    "auth_dir": auth_result.auth_dir,
+                    "regenerated": auth_result.regenerated,
+                }
+            except Exception as exc:
+                APP_STATE["auth"] = {"auth_dir": None, "regenerated": False}
+                APP_STATE["ingestion_status"] = {"state": "auth_error", "error": repr(exc)}
+                logger.error(
+                    "Nubra auth bootstrap failed — ingestion disabled: %s", exc
+                )
+                return
+
+            svc = NubraIngestionService(
+                broker=broker,
+                env_name=settings.nubra_env,
+                exchange=settings.nubra_exchange,
+                initial_nifty_price=settings.initial_nifty_price,
+                strike_radius=settings.strike_radius,
+                include_sdk_ohlcv=settings.subscribe_sdk_ohlcv,
+                include_sdk_option_chain=settings.subscribe_sdk_option_chain,
+                extra_brokers=(realtime_broker,) if settings.use_database else None,
+            )
+            APP_STATE["ingestion"] = svc
+            nonlocal ingestion
+            ingestion = svc
+            await _start_nubra_background(
+                svc,
                 env_name=settings.nubra_env,
                 logger=logger,
-            ),
-            name="NubraIngestionBootstrap",
-            logger=logger,
-        )
+            )
+
+        _track_task(tasks, _boot_ingestion(), name="NubraAuthAndIngestion", logger=logger)
     else:
         APP_STATE["ingestion_status"] = {"state": "disabled", "error": None}
         logger.warning("Nubra ingestion disabled; set ENABLE_NUBRA_SOCKET=true for live ticks")
@@ -225,6 +283,8 @@ async def lifespan(_: FastAPI):
         state=market_state,
         initial_nifty_price=settings.initial_nifty_price,
         ingestion=ingestion,
+        nifty_ohlc_aggregator=nifty_ohlc_aggregator,
+        order_book_aggregator=order_book_aggregator,
     )
     _track_task(tasks, pipeline.run_forever(), name="RealtimePipeline.run", logger=logger)
     _track_task(
@@ -236,10 +296,21 @@ async def lifespan(_: FastAPI):
             interval_minutes=settings.candle_interval_minutes,
             tz_name=settings.market_timezone,
             debug_state=APP_STATE["candle_scheduler"],  # type: ignore[arg-type]
+            nifty_ohlc_aggregator=nifty_ohlc_aggregator,
+            order_book_aggregator=order_book_aggregator,
+            db_writer=db_writer,
         ),
         name="Candle3mScheduler",
         logger=logger,
     )
+
+    if database_task_kwargs is not None:
+        _track_task(
+            tasks,
+            _start_database_background(**database_task_kwargs),
+            name="DatabaseRuntime",
+            logger=logger,
+        )
 
     APP_STATE["tasks"] = tasks
     logger.info("startup complete: app is accepting traffic; background tasks scheduled=%d", len(tasks))
@@ -294,17 +365,41 @@ async def favicon() -> Response:
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health() -> Response:
+    ingestion_status = APP_STATE.get("ingestion_status", {"state": "unknown"})
+    ingestion_state = ingestion_status.get("state", "unknown")
+    enable_nubra = getattr(settings, "enable_nubra_socket", False)
+
+    # Return 503 when auth has failed and Nubra ingestion is required.
+    if ingestion_state == "auth_error" and enable_nubra:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "degraded",
+                "reason": "auth_error",
+                "detail": ingestion_status.get("error"),
+            },
+        )
+    return JSONResponse(status_code=200, content={"status": "ok"})
 
 
 @app.get("/health/ready")
 async def ready() -> dict[str, Any]:
+    dbw = APP_STATE.get("db_writer")
+    auth_state = APP_STATE.get("auth", {})
+    ingestion_status = APP_STATE.get("ingestion_status", {"state": "unknown"})
     return {
         "status": "ok",
         "startup_mode": APP_STATE.get("startup_mode"),
-        "ingestion": APP_STATE.get("ingestion_status", {"state": "unknown"}),
+        "ingestion": ingestion_status,
+        "auth": {
+            "auth_dir": auth_state.get("auth_dir"),
+            "regenerated": auth_state.get("regenerated"),
+            "state": ingestion_status.get("state"),
+            "error": ingestion_status.get("error") if ingestion_status.get("state") == "auth_error" else None,
+        },
         "database": APP_STATE.get("database_status", {"state": "not_used"}),
+        "db_writer": dbw.stats() if dbw is not None and hasattr(dbw, "stats") else None,  # type: ignore[union-attr]
         "tasks": [
             {
                 "name": task.get_name(),
@@ -314,3 +409,30 @@ async def ready() -> dict[str, Any]:
             for task in APP_STATE.get("tasks", [])  # type: ignore[union-attr]
         ],
     }
+
+
+@app.get("/health/auth")
+async def health_auth() -> Response:
+    """Detailed auth diagnostics for ops."""
+    ingestion_status = APP_STATE.get("ingestion_status", {"state": "unknown"})
+    auth_state = APP_STATE.get("auth", {})
+    ingestion_state = ingestion_status.get("state", "unknown")
+
+    payload: dict[str, Any] = {
+        "ingestion_state": ingestion_state,
+        "ingestion_error": ingestion_status.get("error"),
+        "auth_dir": auth_state.get("auth_dir"),
+        "regenerated": auth_state.get("regenerated"),
+        "enable_nubra_socket": getattr(settings, "enable_nubra_socket", False),
+        "nubra_env": getattr(settings, "nubra_env", None),
+        "x_device_id_set": bool(
+            __import__("os").getenv("NUBRA_X_DEVICE_ID") or __import__("os").getenv("X_DEVICE_ID")
+        ),
+        "session_token_set": bool(
+            __import__("os").getenv("NUBRA_SESSION_TOKEN") or __import__("os").getenv("SESSION_TOKEN")
+        ),
+        "totp_secret_set": bool(__import__("os").getenv("NUBRA_TOTP_SECRET")),
+    }
+
+    status_code = 503 if ingestion_state == "auth_error" else 200
+    return JSONResponse(status_code=status_code, content=payload)

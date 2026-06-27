@@ -1,0 +1,6 @@
+[
+  {"stream": "greeks", "key": "1375001", "timestamp": 1719470400, "payload": {"ref_id": 1375001, "delta": 0.52, "gamma": 0.003, "theta": -5.2, "vega": 12.5, "iv": 13.1, "open_interest": 800000}},
+  {"stream": "greeks", "key": "1375001", "timestamp": 1719470405, "payload": {"ref_id": 1375001, "delta": 0.53, "gamma": 0.003, "theta": -5.1, "vega": 12.4, "iv": 13.0, "open_interest": 801000}},
+  {"stream": "greeks", "key": "1375002", "timestamp": 1719470402, "payload": {"ref_id": 1375002, "delta": -0.48, "gamma": 0.003, "theta": -4.8, "vega": 11.8, "iv": 12.9, "open_interest": 750000}},
+  {"stream": "greeks", "key": "1375002", "timestamp": 1719470407, "payload": {"ref_id": 1375002, "delta": -0.47, "gamma": 0.003, "theta": -4.7, "vega": 11.7, "iv": 12.8, "open_interest": 751000}}
+]

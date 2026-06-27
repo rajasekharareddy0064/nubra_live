@@ -109,6 +109,7 @@ class InstrumentManager:
         self._nifty_fut_refs: list[int] = []
         self._nifty_fut_contract_by_ref: dict[int, str] = {}
         self._nifty_fut_symbol_by_ref: dict[int, str] = {}
+        self._fut_by_symbol: dict[str, dict[str, Any]] = {}
 
         self.df: pd.DataFrame = self._load_instruments()
         self._prepare_indices()
@@ -139,6 +140,10 @@ class InstrumentManager:
     def get_nifty_fut_symbols(self) -> dict[int, str]:
         """Map ``ref_id`` → trading symbol (e.g. ``NIFTY26MAYFUT``)."""
         return dict(self._nifty_fut_symbol_by_ref)
+
+    def get_fut_meta(self, symbol: str) -> dict[str, Any] | None:
+        """Trading symbol → underlying, expiry, instrument_type."""
+        return self._fut_by_symbol.get(str(symbol).strip().upper())
 
     def get_stock_futures(self) -> list[int]:
         return list(self._stock_fut_refs)
@@ -747,9 +752,34 @@ class InstrumentManager:
             expiry_key = pd.Timestamp(expiry_value).strftime("%Y%m%d")
             self._nifty_option_chain_key = f"NIFTY:{expiry_key}"
 
+        self._fut_by_symbol = self._build_fut_by_symbol(df)
+
     # ----------------------------
     # Helpers
     # ----------------------------
+    @staticmethod
+    def _build_fut_by_symbol(df: pd.DataFrame) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        fut = df[df["derivative_type"] == "FUT"]
+        for _, row in fut.iterrows():
+            sym = str(row.get("symbol") or "").strip().upper()
+            if not sym:
+                continue
+            exp_dt = row.get("expiry_dt")
+            expiry_text = ""
+            expiry_py: datetime | None = None
+            if pd.notna(exp_dt):
+                ts = pd.Timestamp(exp_dt).normalize()
+                expiry_text = ts.strftime("%Y-%m-%d")
+                expiry_py = ts.to_pydatetime()
+            out[sym] = {
+                "underlying_symbol": str(row.get("asset") or "").strip().upper(),
+                "expiry": expiry_text,
+                "expiry_dt": expiry_py,
+                "instrument_type": "FUT",
+            }
+        return out
+
     @staticmethod
     def _nearest_50(price: float) -> int:
         return int(round(float(price) / 50.0) * 50)

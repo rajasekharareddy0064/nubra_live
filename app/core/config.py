@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from urllib.parse import quote_plus
 
 
 class Settings(BaseSettings):
@@ -12,7 +13,13 @@ class Settings(BaseSettings):
     api_port: int = 8000
 
     redis_url: str = "redis://localhost:6379/0"
-    postgres_dsn: str = "postgresql://postgres:postgres@localhost:5432/nubra"
+    postgres_dsn: str | None = None
+    db_host: str = "localhost"
+    db_name: str = "nubra"
+    db_user: str = "postgres"
+    db_password: str = "postgres"
+    db_port: int = 5432
+    db_schema: str = "public"
 
     # Realtime mode (no Postgres): tick fan-out + in-memory 3m candles. Set use_database=true for legacy DB workers.
     use_database: bool = False
@@ -36,12 +43,34 @@ class Settings(BaseSettings):
     enable_nubra_socket: bool = False
     initial_nifty_price: float = 22000.0
 
+    # Simulation mode: replays sample data through the pipeline without
+    # connecting to the live Nubra WebSocket. Enabled by setting
+    # SIMULATION_MODE=true or MARKET_MODE=SIMULATION.
+    simulation_mode: bool = False
+    market_mode: str = "LIVE"
+    simulation_speed: float = 1.0  # 1x, 5x, 10x, 0=instant
+    sample_data_dir: str = "sample_data"
+
     # Legacy TOTP flag, retained for backward compatibility only.
     # Session-only authentication ignores this value at runtime — the
     # SDK is always constructed with totp_login=False and tokens are
     # injected directly from auth_data.db.*. Refresh the session by
     # running setup_totp.py from a real terminal.
     nubra_use_totp: bool = True
+
+    @property
+    def is_simulation(self) -> bool:
+        return self.simulation_mode or self.market_mode.upper() == "SIMULATION"
+
+    @property
+    def database_dsn(self) -> str:
+        if self.postgres_dsn:
+            return self.postgres_dsn
+        user = quote_plus(self.db_user)
+        password = quote_plus(self.db_password)
+        host = self.db_host
+        database = quote_plus(self.db_name)
+        return f"postgresql://{user}:{password}@{host}:{self.db_port}/{database}"
 
 
 settings = Settings()

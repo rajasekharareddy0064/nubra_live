@@ -4,6 +4,9 @@ pydantic
 pydantic-settings
 redis
 asyncpg
+numpy
 pandas
 python-dotenv
 pyotp
+google-cloud-secret-manager
+google-cloud-run

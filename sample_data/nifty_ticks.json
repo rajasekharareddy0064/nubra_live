@@ -1,0 +1,12 @@
+[
+  {"stream": "index", "key": "NIFTY", "timestamp": 1719470400, "payload": {"symbol": "NIFTY", "indexname": "NIFTY", "ltp": 24200, "volume": 100000, "change_pct": 0.5, "timestamp": 1719470400}},
+  {"stream": "index", "key": "NIFTY", "timestamp": 1719470401, "payload": {"symbol": "NIFTY", "indexname": "NIFTY", "ltp": 24205, "volume": 100500, "change_pct": 0.52, "timestamp": 1719470401}},
+  {"stream": "index", "key": "NIFTY", "timestamp": 1719470402, "payload": {"symbol": "NIFTY", "indexname": "NIFTY", "ltp": 24198, "volume": 101000, "change_pct": 0.49, "timestamp": 1719470402}},
+  {"stream": "index", "key": "NIFTY", "timestamp": 1719470403, "payload": {"symbol": "NIFTY", "indexname": "NIFTY", "ltp": 24210, "volume": 101500, "change_pct": 0.55, "timestamp": 1719470403}},
+  {"stream": "index", "key": "NIFTY", "timestamp": 1719470404, "payload": {"symbol": "NIFTY", "indexname": "NIFTY", "ltp": 24215, "volume": 102000, "change_pct": 0.57, "timestamp": 1719470404}},
+  {"stream": "index", "key": "NIFTY", "timestamp": 1719470405, "payload": {"symbol": "NIFTY", "indexname": "NIFTY", "ltp": 24220, "volume": 102500, "change_pct": 0.59, "timestamp": 1719470405}},
+  {"stream": "index", "key": "NIFTY", "timestamp": 1719470406, "payload": {"symbol": "NIFTY", "indexname": "NIFTY", "ltp": 24195, "volume": 103000, "change_pct": 0.47, "timestamp": 1719470406}},
+  {"stream": "index", "key": "NIFTY", "timestamp": 1719470407, "payload": {"symbol": "NIFTY", "indexname": "NIFTY", "ltp": 24200, "volume": 103500, "change_pct": 0.50, "timestamp": 1719470407}},
+  {"stream": "index", "key": "NIFTY", "timestamp": 1719470408, "payload": {"symbol": "NIFTY", "indexname": "NIFTY", "ltp": 24225, "volume": 104000, "change_pct": 0.60, "timestamp": 1719470408}},
+  {"stream": "index", "key": "NIFTY", "timestamp": 1719470409, "payload": {"symbol": "NIFTY", "indexname": "NIFTY", "ltp": 24230, "volume": 104500, "change_pct": 0.62, "timestamp": 1719470409}}
+]

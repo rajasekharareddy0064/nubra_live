@@ -254,6 +254,15 @@ class WebSocketManager:
         await self._teardown_socket()
         self._main_loop = None
 
+    async def reconnect_for_session_refresh(self) -> None:
+        """Rebuild the socket after auth_data.db.* has been regenerated."""
+        if self._closing or self._fatal:
+            return
+        await self._hard_reconnect(
+            reason="session-refreshed",
+            force_auth_refresh=True,
+        )
+
     # ------------------------------------------------------------------
     # Subscription API
     # ------------------------------------------------------------------
@@ -726,6 +735,7 @@ class WebSocketManager:
 
     def _cb_connect(self, _msg: Any) -> None:
         self.logger.info("WebSocket connected")
+        self.logger.info("WS_CONNECTED")
         loop = self._main_loop
         event = self._connect_event
         if loop and event:

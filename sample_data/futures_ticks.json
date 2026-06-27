@@ -1,0 +1,10 @@
+[
+  {"stream": "index", "key": "NIFTY26JUNFUT", "timestamp": 1719470400, "payload": {"symbol": "NIFTY26JUNFUT", "indexname": "NIFTY26JUNFUT", "ltp": 24250, "volume": 5000000, "oi": 12000000, "timestamp": 1719470400}},
+  {"stream": "index", "key": "NIFTY26JUNFUT", "timestamp": 1719470401, "payload": {"symbol": "NIFTY26JUNFUT", "indexname": "NIFTY26JUNFUT", "ltp": 24255, "volume": 5010000, "oi": 12000500, "timestamp": 1719470401}},
+  {"stream": "index", "key": "NIFTY26JUNFUT", "timestamp": 1719470402, "payload": {"symbol": "NIFTY26JUNFUT", "indexname": "NIFTY26JUNFUT", "ltp": 24248, "volume": 5020000, "oi": 12001000, "timestamp": 1719470402}},
+  {"stream": "index", "key": "NIFTY26JUNFUT", "timestamp": 1719470403, "payload": {"symbol": "NIFTY26JUNFUT", "indexname": "NIFTY26JUNFUT", "ltp": 24260, "volume": 5030000, "oi": 12001500, "timestamp": 1719470403}},
+  {"stream": "index", "key": "NIFTY26JUNFUT", "timestamp": 1719470404, "payload": {"symbol": "NIFTY26JUNFUT", "indexname": "NIFTY26JUNFUT", "ltp": 24265, "volume": 5040000, "oi": 12002000, "timestamp": 1719470404}},
+  {"stream": "index", "key": "RELIANCE26JUNFUT", "timestamp": 1719470400, "payload": {"symbol": "RELIANCE26JUNFUT", "indexname": "RELIANCE26JUNFUT", "ltp": 2950, "volume": 3000000, "oi": 8000000, "timestamp": 1719470400}},
+  {"stream": "index", "key": "RELIANCE26JUNFUT", "timestamp": 1719470402, "payload": {"symbol": "RELIANCE26JUNFUT", "indexname": "RELIANCE26JUNFUT", "ltp": 2955, "volume": 3010000, "oi": 8000500, "timestamp": 1719470402}},
+  {"stream": "index", "key": "RELIANCE26JUNFUT", "timestamp": 1719470404, "payload": {"symbol": "RELIANCE26JUNFUT", "indexname": "RELIANCE26JUNFUT", "ltp": 2948, "volume": 3020000, "oi": 8001000, "timestamp": 1719470404}}
+]

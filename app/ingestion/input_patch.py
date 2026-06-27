@@ -177,7 +177,7 @@ def _short(prompt: str) -> str:
 
 
 def _read_totp_secret() -> str:
-    secret = (os.getenv("NUBRA_TOTP_SECRET") or "").strip()
+    secret = (os.getenv("NUBRA_TOTP_SECRET") or "").strip().lstrip("\ufeff").replace(" ", "")
     if not secret:
         raise NubraAuthError(
             "NUBRA_TOTP_SECRET is not set. The Nubra SDK is asking for a "
@@ -186,6 +186,10 @@ def _read_totp_secret() -> str:
             "value emitted by setup_totp.py / enroll_totp.py."
         )
     return secret
+
+
+def _clean_secret_env(name: str) -> str:
+    return (os.getenv(name) or "").strip().lstrip("\ufeff").replace(" ", "")
 
 
 def _generate_totp(secret: Optional[str] = None) -> str:
@@ -281,7 +285,7 @@ def _patched_input(prompt: str = "") -> str:
         raise NubraAuthError(msg)
 
     if kind == "phone":
-        phone = (os.getenv("PHONE_NO") or "").strip()
+        phone = _clean_secret_env("PHONE_NO")
         if not phone:
             raise NubraAuthError(
                 f"SDK requested phone number (prompt={short!r}) but "
@@ -291,7 +295,7 @@ def _patched_input(prompt: str = "") -> str:
         return phone
 
     if kind == "mpin":
-        mpin = (os.getenv("MPIN") or "").strip()
+        mpin = _clean_secret_env("MPIN")
         if not mpin:
             raise NubraAuthError(
                 f"SDK requested MPIN (prompt={short!r}) but MPIN is not "
@@ -301,7 +305,7 @@ def _patched_input(prompt: str = "") -> str:
         return mpin
 
     if kind == "password":
-        pw = (os.getenv("PASSWORD") or "").strip()
+        pw = _clean_secret_env("PASSWORD")
         if not pw:
             raise NubraAuthError(
                 f"SDK requested password (prompt={short!r}) but PASSWORD "
@@ -358,7 +362,7 @@ def install_non_interactive_input_patch(
             logger.debug("Input patch already installed; skipping")
             return
 
-        secret = (os.getenv("NUBRA_TOTP_SECRET") or "").strip()
+        secret = (os.getenv("NUBRA_TOTP_SECRET") or "").strip().lstrip("\ufeff").replace(" ", "")
 
         if require_totp_secret and not secret:
             raise NubraAuthError(
