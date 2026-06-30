@@ -167,7 +167,7 @@ async def run_auth_refresh() -> int:
     ensure_auth_dir()
     install_non_interactive_input_patch(require_totp_secret=True)
 
-    svc = AuthService(env_name=env_name, max_attempts=3, base_backoff=2.0)
+    svc = AuthService(env_name=env_name, max_attempts=3, base_backoff=2.0, skip_refdata=True)
 
     try:
         client = await svc.authenticate()

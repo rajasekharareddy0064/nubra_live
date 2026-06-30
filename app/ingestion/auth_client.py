@@ -408,15 +408,14 @@ def session_is_expired(*, base_dir: str | Path | None = None) -> bool:
 def _ensure_nubra_ref_master_if_empty(client: Any) -> None:
     """Populate ``InitNubraSdk.DF_REF_DATA_*`` when it is still empty.
 
-    The session-fast path arms ``InitNubraSdk.FLAG`` **before**
-    ``InitNubraSdk.__init__``, so the SDK skips ``__refresh_ref_data``
-    — that is where ``_get_instruments()`` runs and fills the master.
-    Without this call, ``InstrumentData(client).get_instruments_dataframe()``
-    always returns an empty frame.
+    Uses a three-level fallback:
+      1. Google Cloud Storage cache (fastest, <5s)
+      2. Local CSV bundled in the Docker image (<10s)
+      3. Nubra SDK _get_instruments() with 60s timeout + 3 retries
 
-    The TOTP / full-login path already runs ``__refresh_ref_data`` in
-    ``__init__``; this helper no-ops when ``DF_REF_DATA_NSE`` already
-    has rows.
+    The SDK's session-fast path arms ``InitNubraSdk.FLAG`` before
+    ``__init__``, skipping ``__refresh_ref_data``. This function fills
+    the gap without blocking startup indefinitely.
     """
     import pandas as pd
     from nubra_python_sdk.start_sdk import InitNubraSdk
@@ -425,37 +424,31 @@ def _ensure_nubra_ref_master_if_empty(client: Any) -> None:
     if isinstance(nse, pd.DataFrame) and not nse.empty:
         return
 
-    getter = getattr(client, "_get_instruments", None)
-    if not callable(getter):
-        raise NubraAuthError(
-            "Nubra SDK client has no _get_instruments(); cannot load instrument master."
-        )
+    from app.storage.instrument_cache import load_instrument_master
 
     logger.info(
-        "Instrument master empty — calling SDK _get_instruments() "
-        "(session-fast InitNubraSdk.__init__ skips __refresh_ref_data)"
+        "Instrument master empty — loading via three-level cache "
+        "(GCS → local CSV → Nubra SDK)"
     )
+
     try:
-        status = getter()
-    except Exception as exc:
-        logger.exception("Nubra _get_instruments failed: %s", exc)
-        raise NubraAuthError(
-            f"Failed to download instrument master from Nubra refdata API: {exc}"
-        ) from exc
+        df = load_instrument_master(client)
+    except RuntimeError as exc:
+        logger.error("Instrument master load failed: %s", exc)
+        raise NubraAuthError(str(exc)) from exc
 
-    nse2 = InitNubraSdk.DF_REF_DATA_NSE
-    rows = len(nse2) if isinstance(nse2, pd.DataFrame) else 0
-    logger.info(
-        "Instrument master loaded | refdata_http=%s | nse_rows=%d",
-        status,
-        rows,
-    )
+    # Inject into the SDK's class-level storage so downstream code
+    # (InstrumentData, InstrumentManager) sees the data.
+    InitNubraSdk.DF_REF_DATA_NSE = df
+
+    rows = len(df) if isinstance(df, pd.DataFrame) else 0
+    logger.info("Instrument master populated | rows=%d", rows)
+
     if rows == 0:
         raise NubraAuthError(
-            "Instrument reference data is empty after calling the Nubra refdata API "
-            f"(HTTP status {status}). Check NUBRA_ENV matches your enrolment, refresh "
-            "auth_data.db.* (setup_totp.py / enroll_totp.py), and verify your session "
-            "can access GET /refdata/refdata/<today>."
+            "Instrument reference data is empty after all fallback levels. "
+            "Upload a valid instrument_master_cache.csv to "
+            "gs://stock-anaysis-cache/ or check Nubra API access."
         )
 
 
@@ -688,6 +681,7 @@ def get_authenticated_client(
     *,
     env_name: str = "UAT",
     force_refresh: bool = False,
+    skip_refdata: bool = False,
     **_legacy_kwargs: Any,
 ) -> Any:
     """Return an authenticated Nubra SDK client.
@@ -701,6 +695,14 @@ def get_authenticated_client(
     * Falls back to a single TOTP login
       (:func:`_build_via_totp_login`) when the cache is empty / stale.
     * Raises :class:`NubraAuthError` once on any unrecoverable failure.
+
+    Parameters
+    ----------
+    skip_refdata:
+        If True, skip loading the instrument reference master after
+        authentication. Used by the auth-refresh job which only needs
+        to validate the session, not load instruments (which may be
+        empty on weekends/holidays when markets are closed).
 
     ``**_legacy_kwargs`` absorbs older parameters
     (``max_attempts`` / ``base_backoff_seconds`` /
@@ -736,7 +738,10 @@ def get_authenticated_client(
             client = _build_via_totp_login(env_name=env_name, base_dir=auth_dir)
             source = "totp-login"
 
-        _ensure_nubra_ref_master_if_empty(client)
+        if not skip_refdata:
+            _ensure_nubra_ref_master_if_empty(client)
+        else:
+            logger.info("skip_refdata=True — skipping instrument master load (auth-only mode)")
 
         _cached_client = client
 

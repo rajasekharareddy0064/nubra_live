@@ -29,8 +29,8 @@ Thumbs.db
 *.log
 logs/
 
-# Large / regenerable instrument cache (refetch via SDK at runtime)
-instrument_master_cache.csv
+# Large / regenerable instrument cache (now bundled in Docker for Level 2 fallback)
+# instrument_master_cache.csv
 
 # Cursor / tooling
 .cursor/

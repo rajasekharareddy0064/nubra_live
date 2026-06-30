@@ -89,10 +89,12 @@ class AuthService:
         env_name: str,
         max_attempts: int = 3,
         base_backoff: float = 2.0,
+        skip_refdata: bool = False,
     ) -> None:
         self._env_name = env_name
         self._max_attempts = max_attempts
         self._base_backoff = base_backoff
+        self._skip_refdata = skip_refdata
 
         self._client: Optional[Any] = None
         self._authenticated_at: Optional[float] = None
@@ -217,6 +219,7 @@ class AuthService:
                         get_authenticated_client,
                         env_name=self._env_name,
                         force_refresh=(attempt > 1),
+                        skip_refdata=self._skip_refdata,
                     )
                     self._client = client
                     self._authenticated_at = time.time()
@@ -291,6 +294,7 @@ class AuthService:
                 get_authenticated_client,
                 env_name=self._env_name,
                 force_refresh=True,
+                skip_refdata=self._skip_refdata,
             )
             self._client = client
             self._authenticated_at = time.time()

@@ -127,6 +127,21 @@ class NubraIngestionService:
             return {"socket": "uninitialised"}
         return self.ws_manager.health()
 
+    def reference_map_status(self, nifty_price: float | None = None) -> dict[str, Any]:
+        """Reference-map readiness for the startup gate / health logging."""
+        if self.instrument_manager is None:
+            return {
+                "master_loaded": False,
+                "master_rows": 0,
+                "option_count": 0,
+                "future_count": 0,
+                "stock_count": 0,
+                "opt_map_size": 0,
+                "fut_map_size": 0,
+                "stock_map_size": 0,
+            }
+        return self.instrument_manager.reference_map_status(nifty_price)
+
     # ------------------------------------------------------------------
     # Subscription orchestration
     # ------------------------------------------------------------------

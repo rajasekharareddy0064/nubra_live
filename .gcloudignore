@@ -18,5 +18,5 @@ uvicorn_*.log
 uvicorn_*.out.log
 uvicorn_*.err.log
 auth_data.db.*
-instrument_master_cache.csv
+# instrument_master_cache.csv is now bundled in the Docker image for Level 2 fallback
 docker-compose.yml

@@ -177,6 +177,8 @@ class _SideAggregate:
             "bid_removed": _round(self.bid_removed_sum) or 0.0,
             "avg_spread": _round(avg_spread) or 0.0,
             "spread_change": _round(self.spread_change_sum) or 0.0,
+            "has_data": self.samples > 0,
+            "tick_count": self.samples,
         }
 
 
@@ -187,7 +189,12 @@ class _StrikeAggregate:
 
 
 class OrderBookAggregator:
-    """Aggregates option orderbook updates for breakout detection."""
+    """Aggregates option orderbook updates for breakout detection.
+
+    All internal strike keys are stored and compared in RUPEES regardless
+    of the wire domain (paise on PROD, rupees on UAT). The price_scale
+    from the pipeline converts wire strikes to rupees on every tick.
+    """
 
     def __init__(
         self,
@@ -198,9 +205,9 @@ class OrderBookAggregator:
     ) -> None:
         self._strike_radius = strike_radius
         self._emit_radius = emit_radius
-        self._strike_step = strike_step
-        self._atm: int | None = None
-        self._strikes: dict[int, _StrikeAggregate] = {}
+        self._strike_step = strike_step        # always in RUPEES (50)
+        self._atm: int | None = None           # stored in RUPEES
+        self._strikes: dict[int, _StrikeAggregate] = {}  # keys in RUPEES
         self._spread_history: deque[float] = deque(maxlen=30)
         self._exec_delta_history: deque[float] = deque(maxlen=30)
         self._ask_removed_history: deque[float] = deque(maxlen=30)
@@ -232,8 +239,11 @@ class OrderBookAggregator:
         price_scale: float = 1.0,
         bucket_id: str | None = None,
     ) -> None:
-        candidate_atm = get_atm_strike(atm_source, step=self._strike_step)
-        strike_int = int(_f(strike))
+        # atm_source is already in RUPEES (pipeline._to_rupees converts it).
+        # strike comes from InstrumentManager.get_ref_maps() which already divides
+        # by _strike_scale — so it is ALSO in RUPEES. No further conversion needed.
+        strike_rupees = int(round(float(strike)))
+        candidate_atm = get_atm_strike(float(atm_source or 0), step=self._strike_step)
         side = _normalize_side(option_type)
         if side not in {"CE", "PE"}:
             return
@@ -273,19 +283,20 @@ class OrderBookAggregator:
                 sell_qty = traded_qty if ask_qty > bid_qty else 0.0
 
         async with self._lock:
+            # ATM and strike_rupees are both in rupees — comparison is correct.
             if self._atm is None and candidate_atm is not None:
                 self._atm = candidate_atm
             atm = self._atm or candidate_atm
             selected = bool(
                 atm is not None
-                and strike_int > 0
-                and abs(strike_int - atm) <= self._strike_radius * self._strike_step
+                and strike_rupees > 0
+                and abs(strike_rupees - atm) <= self._strike_radius * self._strike_step
             )
             if not selected:
                 self._log_update(
                     bucket_id=bucket_id,
                     atm=atm,
-                    strike=strike_int,
+                    strike=strike_rupees,
                     option_type=side,
                     selected=False,
                     bid_qty=bid_qty,
@@ -297,7 +308,8 @@ class OrderBookAggregator:
                 )
                 return
 
-            strike_bucket = self._strikes.setdefault(strike_int, _StrikeAggregate())
+            # Store aggregate keyed by rupee-strike
+            strike_bucket = self._strikes.setdefault(strike_rupees, _StrikeAggregate())
             aggregate = strike_bucket.ce if side == "CE" else strike_bucket.pe
             aggregate.update(
                 bid_qty=bid_qty,
@@ -313,7 +325,7 @@ class OrderBookAggregator:
             self._log_update(
                 bucket_id=bucket_id,
                 atm=atm,
-                strike=strike_int,
+                strike=strike_rupees,
                 option_type=side,
                 selected=True,
                 bid_qty=bid_qty,
@@ -330,11 +342,22 @@ class OrderBookAggregator:
         atm_source: Any,
         options_by_strike: dict[Any, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        atm = self._atm or get_atm_strike(atm_source, step=self._strike_step)
+        # atm_source is in RUPEES (from pipeline._last_nifty).
+        # self._atm is also in RUPEES. Both use the same scale.
+        atm = self._atm or get_atm_strike(float(atm_source or 0), step=self._strike_step)
         async with self._lock:
             snapshot = self._snapshot_locked(atm, options_by_strike or {})
             self._atm = None
             self._strikes = {}
+            rows_with_data = sum(1 for r in snapshot.get("strikes", []) if r.get("has_data", True))
+            total_rows = len(snapshot.get("strikes", []))
+            logger.info(
+                "SNAPSHOT_RESET | atm=%s strike_count=%d rows_with_data=%d is_empty=%s",
+                atm,
+                total_rows,
+                rows_with_data,
+                snapshot.get("is_empty", False),
+            )
             return snapshot
 
     def _log_update(
@@ -414,19 +437,23 @@ class OrderBookAggregator:
                 spread_count += side.spread_count
 
         for strike in selected_strikes:
-            aggregate = self._strikes.get(strike, _StrikeAggregate())
-            ce = aggregate.ce
-            pe = aggregate.pe
+            aggregate = self._strikes.get(strike)
+            has_data = aggregate is not None
+            ce_dict = aggregate.ce.to_dict() if has_data else {}
+            pe_dict = aggregate.pe.to_dict() if has_data else {}
             rows.append(
                 {
                     "strike": strike,
-                    "ce": ce.to_dict(),
-                    "pe": pe.to_dict(),
+                    "has_data": has_data,
+                    "tick_count": (aggregate.ce.samples + aggregate.pe.samples) if has_data else 0,
+                    "ce": ce_dict,
+                    "pe": pe_dict,
                 }
             )
 
         exec_delta = total_buy_qty - total_sell_qty
         book_delta = total_bid_qty - total_ask_qty
+        candle_has_data = total_bid_qty > 0 or total_buy_qty > 0 or total_ask_removed > 0
         imbalance_denominator = total_bid_qty + total_ask_qty
         imbalance = (
             (total_bid_qty - total_ask_qty) / imbalance_denominator
@@ -485,6 +512,7 @@ class OrderBookAggregator:
 
         return {
             "atm": atm,
+            "is_empty": not candle_has_data,
             "support_strike": support_strike,
             "resistance_strike": resistance_strike,
             "activity_strike": activity_strike,

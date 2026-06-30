@@ -40,6 +40,7 @@ class DBWriter:
         self.order_book_candle_table = f"{self._q(self.schema)}.{self._q('order_book_3m_candles')}"
         self.futures_data_table = f"{self._q(self.schema)}.{self._q('futures_data')}"
         self.nifty50_stock_futures_table = f"{self._q(self.schema)}.{self._q('nifty50_stock_futures')}"
+        self.options_data_table = f"{self._q(self.schema)}.{self._q('options_data')}"
 
     async def connect(self) -> None:
         self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=5)
@@ -80,6 +81,16 @@ class DBWriter:
         if not batches:
             return
 
+        self.logger.info(
+            "DB_FLUSH_START | topics=%s total_rows=%d queue_remaining=%d",
+            {t: len(p) for t, p in batches.items()},
+            total_rows,
+            self.queue.qsize(),
+        )
+
+        import time as _time
+        flush_start = _time.time()
+
         async with self.pool.acquire() as conn:
             self.last_flush_topics = {topic: len(payloads) for topic, payloads in batches.items()}
             order_book_rows = batches.pop("order_book_3m", [])
@@ -92,6 +103,10 @@ class DBWriter:
                 await self._insert_futures_data(conn, futures_rows)
                 await self._insert_nifty50_stock_futures(conn, futures_rows)
 
+            options_rows = batches.pop("options_3m", [])
+            if options_rows:
+                await self._insert_options_data(conn, options_rows)
+
             rows: list[tuple[str, str, datetime]] = []
             now = datetime.now(timezone.utc)
             for topic, payloads in batches.items():
@@ -101,9 +116,15 @@ class DBWriter:
                     f"INSERT INTO {self.market_events_table}(topic, payload, created_at) VALUES($1, $2::jsonb, $3)",
                     rows,
                 )
+
+        elapsed_ms = (_time.time() - flush_start) * 1000
         self.flushed_total += total_rows
         self.last_flush_error = None
         self.last_flush_at = datetime.now(timezone.utc)
+        self.logger.info(
+            "DB_FLUSH_SUCCESS | rows=%d elapsed_ms=%.0f topics=%s",
+            total_rows, elapsed_ms, dict(self.last_flush_topics),
+        )
 
     def stats(self) -> dict[str, Any]:
         return {
@@ -131,6 +152,9 @@ class DBWriter:
             for row in strikes:
                 if not isinstance(row, dict):
                     continue
+                # Only insert rows that have actual tick data
+                if not row.get("has_data", True):
+                    continue
                 ce = row.get("ce") if isinstance(row.get("ce"), dict) else {}
                 pe = row.get("pe") if isinstance(row.get("pe"), dict) else {}
                 rows.append(
@@ -156,6 +180,17 @@ class DBWriter:
 
         if not rows:
             return
+
+        rows_total_checked = sum(
+            len(self._normalize_strike_rows(payload.get("order_book") if isinstance(payload.get("order_book"), dict) else {}))
+            for payload in payloads
+        )
+        rows_skipped = rows_total_checked - len(rows)
+        self.logger.info(
+            "ORDER_BOOK_3M_INSERT | rows_written=%d rows_skipped=%d",
+            len(rows),
+            rows_skipped,
+        )
 
         strike_count = len({row[2] for row in rows})
         if strike_count < 10:
@@ -456,6 +491,176 @@ class DBWriter:
             """,
             rows,
         )
+
+    # ------------------------------------------------------------------
+    # options_data (additive — snapshot of the ATM option chain per bar)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _opt_leg_val(leg: dict[str, Any], *keys: str) -> float | None:
+        """First non-null numeric among ``keys`` in an option leg dict."""
+        for k in keys:
+            v = leg.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    @staticmethod
+    def _opt_moneyness(side: str, strike: float, spot: float | None) -> str | None:
+        if not spot or spot <= 0:
+            return None
+        if abs(strike - spot) < 25:  # inside half a 50-pt step → at-the-money
+            return "ATM"
+        if side == "CE":
+            return "ITM" if spot > strike else "OTM"
+        return "ITM" if spot < strike else "OTM"
+
+    async def _insert_options_data(
+        self,
+        conn: asyncpg.Connection,
+        payloads: list[dict[str, Any]],
+    ) -> None:
+        """Persist a per-bar snapshot of the ATM option chain into options_data.
+
+        Source is ``state.option_chain_view`` (one entry per strike, each
+        carrying CE/PE legs). Prices are stored in RUPEES to match the rest
+        of the nubra-live system (futures_data / order_book_3m), NOT the
+        paise convention of the retired legacy writer. There is no per-option
+        OHLC accumulation in this pipeline, so open/high/low/close are set to
+        the snapshot LTP (a flat point-in-time bar). Greeks/IV/OI are the
+        latest snapshot values (correctly NOT aggregated).
+        """
+        rows: list[tuple[Any, ...]] = []
+        rows_received = 0
+        skipped_no_expiry = 0
+        skipped_no_price = 0
+        for payload in payloads:
+            chain = payload.get("chain") if isinstance(payload.get("chain"), list) else []
+            timestamp = self._timestamp(payload.get("bucket_end") or payload.get("timestamp"))
+            expiry = str(payload.get("expiry") or "").strip()
+            underlying = str(payload.get("underlying") or "NIFTY").strip().upper()
+            spot = self._opt_leg_val(payload, "spot")
+            if not expiry:
+                skipped_no_expiry += 1
+                self.logger.warning(
+                    "OPTION_DB_FAILED | reason=missing_expiry bucket=%s rows_in_chain=%d",
+                    payload.get("bucket_end"), len(chain),
+                )
+                continue
+            # asyncpg binds DATE params as datetime.date, not str.
+            try:
+                expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+            except (TypeError, ValueError):
+                skipped_no_expiry += 1
+                self.logger.warning(
+                    "OPTION_DB_FAILED | reason=bad_expiry expiry=%r bucket=%s",
+                    expiry, payload.get("bucket_end"),
+                )
+                continue
+            expiry_compact = expiry.replace("-", "")
+            for crow in chain:
+                if not isinstance(crow, dict):
+                    continue
+                try:
+                    strike = int(round(float(crow.get("strike"))))
+                except (TypeError, ValueError):
+                    continue
+                for side in ("CE", "PE"):
+                    leg = crow.get(side)
+                    if not isinstance(leg, dict) or not leg:
+                        continue
+                    rows_received += 1
+                    ltp = self._opt_leg_val(leg, "ltp", "last_price", "close")
+                    if ltp is None or ltp <= 0:
+                        skipped_no_price += 1
+                        continue
+                    volume = self._opt_leg_val(leg, "volume", "traded_volume", "tradedVolume")
+                    oi = self._opt_leg_val(leg, "oi", "open_interest", "openInterest")
+                    delta = self._opt_leg_val(leg, "delta")
+                    gamma = self._opt_leg_val(leg, "gamma")
+                    theta = self._opt_leg_val(leg, "theta")
+                    vega = self._opt_leg_val(leg, "vega")
+                    iv = self._opt_leg_val(leg, "iv")
+                    symbol = f"NIFTY{expiry_compact}{strike}{side}"
+                    price = self._num(ltp)
+                    rows.append(
+                        (
+                            timestamp,                       # 1  timestamp
+                            symbol,                          # 2  symbol
+                            expiry_date,                     # 3  expiry (date)
+                            self._num(strike),               # 4  strike
+                            side,                            # 5  option_type
+                            price,                           # 6  open
+                            price,                           # 7  high
+                            price,                           # 8  low
+                            price,                           # 9  close
+                            self._wire_int(volume, 1.0),     # 10 volume (bigint)
+                            self._wire_int(oi, 1.0),         # 11 oi (bigint)
+                            self._num(theta, digits=6),      # 12 theta
+                            self._num(delta, digits=6),      # 13 delta
+                            self._num(gamma, digits=6),      # 14 gamma
+                            self._num(vega, digits=6),       # 15 vega
+                            self._num(iv, digits=6),         # 16 iv
+                            "OPT",                           # 17 instrument_type
+                            None,                            # 18 iv_mid
+                            float(ltp),                      # 19 ltp (double precision)
+                            underlying,                      # 20 underlying_symbol
+                            self._opt_moneyness(side, strike, spot),  # 21 moneyness
+                            (float(strike) - spot) if spot else None,  # 22 spot_distance
+                        )
+                    )
+
+        self.logger.info(
+            "OPTION_DB_INSERT | rows_received=%d rows_built=%d skipped_no_expiry=%d skipped_no_price=%d",
+            rows_received, len(rows), skipped_no_expiry, skipped_no_price,
+        )
+        if not rows:
+            return
+
+        try:
+            await conn.executemany(
+                f"""
+                INSERT INTO {self.options_data_table} (
+                    "timestamp", symbol, expiry, strike, option_type,
+                    open, high, low, close, volume, oi,
+                    theta, delta, gamma, vega, iv,
+                    instrument_type, iv_mid, ltp, underlying_symbol,
+                    moneyness, spot_distance
+                )
+                VALUES (
+                    $1::timestamp, $2, $3::date, $4, $5,
+                    $6, $7, $8, $9, $10, $11,
+                    $12, $13, $14, $15, $16,
+                    $17, $18, $19, $20,
+                    $21, $22
+                )
+                ON CONFLICT ("timestamp", symbol, strike, option_type) DO UPDATE SET
+                    expiry = EXCLUDED.expiry,
+                    open = EXCLUDED.open,
+                    high = EXCLUDED.high,
+                    low = EXCLUDED.low,
+                    close = EXCLUDED.close,
+                    volume = EXCLUDED.volume,
+                    oi = EXCLUDED.oi,
+                    theta = EXCLUDED.theta,
+                    delta = EXCLUDED.delta,
+                    gamma = EXCLUDED.gamma,
+                    vega = EXCLUDED.vega,
+                    iv = EXCLUDED.iv,
+                    instrument_type = EXCLUDED.instrument_type,
+                    ltp = EXCLUDED.ltp,
+                    underlying_symbol = EXCLUDED.underlying_symbol,
+                    moneyness = EXCLUDED.moneyness,
+                    spot_distance = EXCLUDED.spot_distance
+                """,
+                rows,
+            )
+            self.logger.info("OPTION_DB_SUCCESS | rows_inserted=%d", len(rows))
+        except Exception as exc:
+            self.logger.exception("OPTION_DB_FAILED | error=%s", exc)
+            raise
 
     async def _ensure_table(self) -> None:
         if not self.pool:

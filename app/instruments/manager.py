@@ -168,18 +168,8 @@ class InstrumentManager:
         return max(1, int(self._strike_scale))
 
     def to_rupees(self, price: Any) -> float:
-        """Convert a Nubra-feed price to rupees using :attr:`price_scale`.
-
-        ``None`` / unparseable input returns ``0.0`` so callers in the
-        hot path don't need their own try/except.
-        """
-        if price is None:
-            return 0.0
-        try:
-            f = float(price)
-        except (TypeError, ValueError):
-            return 0.0
-        return f / float(self.price_scale)
+        from app.core.price_utils import normalize_price
+        return normalize_price(price, scale=float(self.price_scale), module="manager")
 
     def get_option_tokens(self, atm: int) -> list[int]:
         center_rupee = self._nearest_50(atm)
@@ -228,6 +218,21 @@ class InstrumentManager:
         if not self._nifty_option_chain_key:
             raise LookupError("Current-month NIFTY option-chain key not found")
         return self._nifty_option_chain_key
+
+    def get_option_expiry(self) -> str | None:
+        """Selected NIFTY option expiry as ``YYYY-MM-DD`` (or ``None``).
+
+        Derived from the resolved option-chain key ``NIFTY:YYYYMMDD``.
+        Used by the options_data writer to satisfy the table's NOT NULL
+        expiry column. Read-only; does not mutate any state.
+        """
+        key = self._nifty_option_chain_key or ""
+        if ":" not in key:
+            return None
+        ymd = key.split(":", 1)[1].strip()
+        if len(ymd) != 8 or not ymd.isdigit():
+            return None
+        return f"{ymd[0:4]}-{ymd[4:6]}-{ymd[6:8]}"
 
     def get_index_symbols(self) -> list[str]:
         return list(self._index_symbols)
@@ -357,18 +362,33 @@ class InstrumentManager:
         Classify orderbook ref_ids: NIFTY fut, stock fut symbols, option strike/side.
         """
         atm = self._nearest_50(nifty_price)
-        strikes = self._strike_window(atm)
+        # Build the option-strike window in the MASTER's strike domain
+        # (paise on PROD, where _strike_scale=100 / _strike_step=5000),
+        # exactly like get_option_tokens(). Using the raw rupee ATM with
+        # _strike_window() here was the long-standing bug that left
+        # option_by_ref empty (opt_map_size=0) even though the master held
+        # hundreds of option strikes — every orderbook option tick then
+        # fell through to the "unresolved ref_id" path and the order-book
+        # aggregator stayed empty.
+        center = self._to_strike_domain(atm)
+        strikes = [
+            center + i * self._strike_step
+            for i in range(-self._strike_radius, self._strike_radius + 1)
+        ]
         option_by_ref: dict[int, tuple[int, str]] = {}
         for strike in strikes:
-            pair = self._option_map.get(strike)
+            pair = self._option_map.get(int(strike))
             if not pair:
                 continue
             ce = pair.get("CE")
             pe = pair.get("PE")
+            # Emit the strike back in RUPEES (the domain the pipeline/aggregator
+            # operate in): divide the strike-domain key by _strike_scale.
+            strike_rupees = int(round(strike / max(self._strike_scale, 1)))
             if ce is not None:
-                option_by_ref[int(ce)] = (int(round(strike / max(self._strike_scale, 1))), "CE")
+                option_by_ref[int(ce)] = (strike_rupees, "CE")
             if pe is not None:
-                option_by_ref[int(pe)] = (int(round(strike / max(self._strike_scale, 1))), "PE")
+                option_by_ref[int(pe)] = (strike_rupees, "PE")
 
         stock_fut_symbols: dict[int, str] = {}
         for ref in self._stock_fut_refs:
@@ -390,6 +410,38 @@ class InstrumentManager:
                 ref_id: self._option_symbol_by_ref.get(ref_id, f"NIFTY_{strike}_{side}")
                 for ref_id, (strike, side) in option_by_ref.items()
             },
+        }
+
+    def reference_map_status(self, nifty_price: float | None = None) -> dict[str, Any]:
+        """Health/validation snapshot of the reference maps.
+
+        Returns master-load state plus the sizes of the three ref-id maps
+        the pipeline needs to resolve every orderbook/greeks tick:
+        ``opt_map`` (option ref→strike/side), ``fut_map`` (NIFTY future
+        ref→symbol) and ``stock_map`` (stock future ref→symbol). The
+        startup gate refuses to launch the 3-minute scheduler until all
+        three are > 0.
+        """
+        master_loaded = self.df is not None and not self.df.empty
+        try:
+            px = nifty_price if (nifty_price and float(nifty_price) > 0) else 0.0
+        except (TypeError, ValueError):
+            px = 0.0
+        if px <= 0:
+            px = float(self._active_atm or 0) or 22000.0
+        try:
+            maps = self.get_ref_maps(px)
+        except Exception:
+            maps = {}
+        return {
+            "master_loaded": bool(master_loaded),
+            "master_rows": int(len(self.df)) if master_loaded else 0,
+            "option_count": len(self._option_map),
+            "future_count": len(self._nifty_fut_symbol_by_ref),
+            "stock_count": len(self._stock_fut_refs),
+            "opt_map_size": len(maps.get("option_by_ref") or {}),
+            "fut_map_size": len(maps.get("nifty_fut_symbol_by_ref") or {}),
+            "stock_map_size": len(maps.get("stock_fut_symbols") or {}),
         }
 
     # ----------------------------

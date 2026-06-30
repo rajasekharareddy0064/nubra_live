@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     simulation_speed: float = 1.0  # 1x, 5x, 10x, 0=instant
     sample_data_dir: str = "sample_data"
 
+    # Instrument cache: three-level fallback (GCS → local CSV → SDK)
+    instrument_cache_bucket: str = "stock-anaysis-cache"
+    instrument_cache_file: str = "instrument_master_cache.csv"
+    instrument_download_timeout: int = 60
+
     # Legacy TOTP flag, retained for backward compatibility only.
     # Session-only authentication ignores this value at runtime — the
     # SDK is always constructed with totp_login=False and tokens are

@@ -30,10 +30,22 @@ steps:
       - '--memory=2Gi'
       - '--cpu=2'
       - '--timeout=3600'
-      - '--max-instances=10'
-      - '--min-instances=0'
-      - '--concurrency=80'
-      - '--set-env-vars=NUBRA_ENV=PROD,NUBRA_EXCHANGE=NSE,ENABLE_NUBRA_SOCKET=true,USE_DATABASE=false,USE_REDIS=false,LOG_LEVEL=INFO,ENVIRONMENT=production,STRIKE_RADIUS=15,CANDLE_INTERVAL_MINUTES=3,MARKET_TIMEZONE=Asia/Kolkata,SUBSCRIBE_SDK_OPTION_CHAIN=true,INITIAL_NIFTY_PRICE=22000.0'
+      # SINGLETON: this is a stateful WebSocket ingestion service. Running >1
+      # instance causes split-brain (duplicate subscriptions + each instance
+      # running its own 3-min snapshot scheduler with a separately-loaded
+      # instrument master). Instances still loading the master have empty
+      # ref_maps and write empty/zero order-book snapshots. Pin to exactly 1.
+      - '--max-instances=1'
+      - '--min-instances=1'
+      # Background asyncio loop (WS consumer, pipeline, snapshot scheduler)
+      # must keep running between HTTP requests. With CPU throttling on,
+      # the event loop stalls when idle and drops ticks / misses flushes.
+      - '--no-cpu-throttling'
+      # Singleton ingestion: one in-flight request slot. Prevents Cloud Run
+      # from using request concurrency as a signal to spin up siblings.
+      - '--concurrency=1'
+      - '--set-env-vars=NUBRA_ENV=PROD,NUBRA_EXCHANGE=NSE,ENABLE_NUBRA_SOCKET=true,USE_DATABASE=true,USE_REDIS=false,LOG_LEVEL=INFO,ENVIRONMENT=production,STRIKE_RADIUS=15,CANDLE_INTERVAL_MINUTES=3,MARKET_TIMEZONE=Asia/Kolkata,SUBSCRIBE_SDK_OPTION_CHAIN=true,INITIAL_NIFTY_PRICE=24500.0,DB_SCHEMA=trading_data,POSTGRES_DSN=postgresql://postgres:Welcome6720@/tradingdb?host=/cloudsql/stock-anaysis:asia-south1:tradingmigration'
+      - '--add-cloudsql-instances=stock-anaysis:asia-south1:tradingmigration'
       - '--update-secrets=NUBRA_AUTH_TOKEN=nubra-auth-token:latest,NUBRA_X_DEVICE_ID=nubra-x-device-id:latest,NUBRA_SESSION_TOKEN=nubra-session-token:latest,PHONE_NO=PHONE_NO:latest,MPIN=MPIN:latest,NUBRA_TOTP_SECRET=NUBRA_TOTP_SECRET:latest'
 
 images:

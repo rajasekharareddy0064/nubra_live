@@ -291,12 +291,8 @@ class RealtimePipeline:
         return scale_f if scale_f > 0 else 1.0
 
     def _to_rupees(self, price: Any) -> float:
-        if price is None:
-            return 0.0
-        try:
-            return float(price) / self._price_scale()
-        except (TypeError, ValueError):
-            return 0.0
+        from app.core.price_utils import normalize_price
+        return normalize_price(price, scale=self._price_scale(), module="pipeline")
 
     def _primary_nifty_fut_symbol(self) -> str | None:
         refs = self._ref_maps.get("nifty_fut_refs") or []
@@ -516,6 +512,10 @@ class RealtimePipeline:
                     fut_add = self._volume_from_candle_start(symbol, vol, fut_candle)
                     fut_candle.update(ltp, fut_add, oi=oi, cum_volume=_f(vol) if vol is not None else None)
                     fut["volume"] = fut_candle.volume
+                    self.logger.debug(
+                        "VOLUME_UPDATE | symbol=%s source=index prev=%s current=%s delta=%s candle_vol=%s",
+                        symbol, self._prev_volume_by_symbol.get(symbol), vol, fut_add, fut_candle.volume,
+                    )
                     if symbol == self._primary_nifty_fut_symbol():
                         self.candles.nifty_futures.update(
                             ltp,
@@ -710,60 +710,34 @@ class RealtimePipeline:
 
         if rid in fut_symbol_map:
             symbol = _norm_symbol(fut_symbol_map[rid] or normalized.get("symbol"))
-            if ltp > 0:
-                fut = dict(self.state.futures.get(symbol) or {})
-                fut.update(
-                    {
-                        "symbol": symbol,
-                        "ltp": ltp,
-                        "last_traded_price": ltp,
-                        "cum_volume": vol,
-                        "oi": ob.get("oi"),
-                        "timestamp": ob.get("timestamp"),
-                        "raw": normalized["raw"],
-                    }
-                )
-                fut_candle = self.candles.ensure_futures(symbol)
-                fut_add = self._volume_from_candle_start(symbol, vol, fut_candle)
-                fut_candle.update(ltp, fut_add, oi=ob.get("oi"), cum_volume=vol)
-                fut["volume"] = fut_candle.volume
-                self.state.futures[symbol] = fut
+            # OI update from orderbook is authoritative — update state.
+            # Do NOT update the candle here: _on_index handles LTP+volume for
+            # futures to avoid double-counting (both streams fire for each tick).
+            if ob.get("oi") is not None:
+                cur = dict(self.state.futures.get(symbol) or {})
+                cur["oi"] = ob["oi"]
+                self.state.futures[symbol] = cur
                 if symbol == self._primary_nifty_fut_symbol():
-                    self.state.nifty_futures = fut
-                    self.candles.nifty_futures.update(ltp, fut_add, oi=ob.get("oi"), cum_volume=vol)
-                self.logger.debug(
-                    "candle update orderbook kind=nifty_future rid=%s symbol=%s ltp=%s candle=%s",
-                    rid,
-                    symbol,
-                    ltp,
-                    fut_candle.to_dict(),
-                )
+                    self.state.nifty_futures = cur
+                    self.candles.nifty_futures.oi = ob["oi"]
+                fut_candle = self.candles.ensure_futures(symbol)
+                fut_candle.oi = ob["oi"]
             await self._emit_tick("orderbook", f"NIFTY_FUT:{symbol}", ob)
         elif rid in stock_map:
             sym = _norm_symbol(stock_map[rid])
-            if ltp > 0:
-                stock_candle = self.candles.ensure_stock(sym)
-                stock_add = self._volume_from_candle_start(sym, vol, stock_candle)
-                stock_candle.update(ltp, stock_add, oi=ob.get("oi"), cum_volume=vol)
+            # OI update only — do NOT update candle LTP/volume (handled by _on_index).
+            if ob.get("oi") is not None:
                 self._merge_stock_state(
                     sym,
                     {
                         "symbol": sym,
-                        "ltp": ltp,
-                        "volume": stock_candle.volume,
-                        "cum_volume": vol,
                         "oi": ob.get("oi"),
                         "timestamp": ob.get("timestamp"),
                         "raw": normalized["raw"],
                     },
                 )
-                self.logger.debug(
-                    "candle update orderbook kind=stock_future rid=%s symbol=%s ltp=%s candle=%s",
-                    rid,
-                    sym,
-                    ltp,
-                    stock_candle.to_dict(),
-                )
+                stock_candle = self.candles.ensure_stock(sym)
+                stock_candle.oi = ob["oi"]
             await self._emit_tick("orderbook", f"STOCK_FUT:{sym}", ob)
         elif rid in opt_map or state_option is not None:
             strike, side = opt_map.get(rid) or state_option or (0, "")
@@ -906,6 +880,7 @@ async def run_interval_scheduler(
     nifty_ohlc_aggregator: NiftyOhlcAggregator | None = None,
     order_book_aggregator: OrderBookAggregator | None = None,
     db_writer: DBWriter | None = None,
+    instance_uid: str | None = None,
 ) -> None:
     tz = market_tz(tz_name)
     last_emitted_start: datetime | None = None
@@ -1048,6 +1023,41 @@ async def run_interval_scheduler(
                 )
             else:
                 order_book = None
+
+            # ── RUNTIME SNAPSHOT HEALTH ─────────────────────────────────
+            # Per-interval proof that the reference maps stayed populated
+            # and the order-book snapshot carries real CE/PE data.
+            if order_book is not None:
+                ob_strikes = order_book.get("strikes", []) or []
+                rows_with_data = sum(1 for r in ob_strikes if r.get("has_data"))
+                rows_without_data = len(ob_strikes) - rows_with_data
+                opt_map_size = fut_map_size = stock_map_size = -1
+                try:
+                    from app.main import APP_STATE as _APP_STATE  # late import: avoid cycle
+
+                    _ing = _APP_STATE.get("ingestion") if isinstance(_APP_STATE, dict) else None
+                    if _ing is not None and getattr(_ing, "instrument_manager", None) is not None:
+                        _ms = _ing.instrument_manager.reference_map_status(index_candle.get("close"))
+                        opt_map_size = _ms["opt_map_size"]
+                        fut_map_size = _ms["fut_map_size"]
+                        stock_map_size = _ms["stock_map_size"]
+                except Exception:
+                    pass
+                log.info(
+                    "SNAPSHOT_HEALTH | uid=%s bucket=%s atm=%s orderbook_strike_count=%d "
+                    "rows_with_data=%d rows_without_data=%d "
+                    "opt_map_size=%d fut_map_size=%d stock_map_size=%d is_empty=%s",
+                    instance_uid,
+                    bucket_id,
+                    order_book.get("atm"),
+                    len(ob_strikes),
+                    rows_with_data,
+                    rows_without_data,
+                    opt_map_size,
+                    fut_map_size,
+                    stock_map_size,
+                    order_book.get("is_empty"),
+                )
             if nifty_ohlc_aggregator is not None:
                 nifty = await nifty_ohlc_aggregator.snapshot_and_reset()
             else:
@@ -1064,12 +1074,16 @@ async def run_interval_scheduler(
                 }
 
             log.info(
-                "emit candle_3m bucket_id=%s index_ticks=%s futures=%d stocks=%d clients=%d",
+                "emit candle_3m bucket_id=%s index_ticks=%s futures=%d stocks=%d clients=%d "
+                "db_writer=%s order_book_agg=%s nifty_close=%s",
                 bucket_id,
                 candle_board.nifty.tick_count,
                 len(futures_candle_dicts),
                 len(stock_candle_dicts),
                 hub.client_count,
+                "connected" if db_writer is not None else "None",
+                "present" if order_book is not None else "None",
+                index_candle.get("close"),
             )
 
             msg: dict[str, Any] = {
@@ -1112,22 +1126,39 @@ async def run_interval_scheduler(
             }
             if db_writer is not None and order_book is not None:
                 try:
-                    await db_writer.enqueue(
-                        "order_book_3m",
-                        {
-                            "bucket_id": bucket_id,
-                            "bucket_start": bucket_start.isoformat(),
-                            "bucket_end": bucket_end.isoformat(),
-                            "interval_minutes": interval_minutes,
-                            "order_book": order_book,
-                        },
-                    )
+                    if order_book.get("is_empty"):
+                        log.info(
+                            "ORDERBOOK_3M_SKIPPED | bucket=%s reason=no_tick_data",
+                            bucket_id,
+                        )
+                    else:
+                        log.info(
+                            "QUEUE_ENQUEUE | topic=order_book_3m bucket=%s strikes=%d atm=%s",
+                            bucket_id,
+                            len(order_book.get("strikes", [])),
+                            order_book.get("atm"),
+                        )
+                        await db_writer.enqueue(
+                            "order_book_3m",
+                            {
+                                "bucket_id": bucket_id,
+                                "bucket_start": bucket_start.isoformat(),
+                                "bucket_end": bucket_end.isoformat(),
+                                "interval_minutes": interval_minutes,
+                                "order_book": order_book,
+                            },
+                        )
                 except Exception as exc:
                     log.exception("failed enqueueing order_book_3m bucket_id=%s: %s", bucket_id, exc)
+            elif db_writer is not None:
+                log.warning(
+                    "ORDERBOOK_3M_SKIPPED | bucket=%s order_book=%s (None means OrderBookAggregator returned nothing)",
+                    bucket_id,
+                    "None" if order_book is None else f"keys={list(order_book.keys())}",
+                )
             if db_writer is not None:
                 try:
                     fut_meta: dict[str, dict[str, Any]] = {}
-                    price_scale = 1.0
                     try:
                         from app.main import APP_STATE  # late import: avoid cycle
 
@@ -1136,14 +1167,22 @@ async def run_interval_scheduler(
                         ingestion = None
                     manager = getattr(ingestion, "instrument_manager", None)
                     if manager is not None:
-                        try:
-                            price_scale = float(getattr(manager, "price_scale", 1) or 1)
-                        except (TypeError, ValueError):
-                            price_scale = 1.0
                         for sym in list(futures_candle_dicts) + list(stock_candle_dicts):
                             meta = manager.get_fut_meta(sym)
                             if meta:
                                 fut_meta[sym] = meta
+                    # Candle prices are already in RUPEES (converted by pipeline._to_rupees).
+                    # Pass price_scale=1.0 so DBWriter stores them as-is without multiplying.
+                    price_scale = 1.0
+                    log.info(
+                        "QUEUE_ENQUEUE | topic=futures_3m bucket=%s futures=%d stocks=%d "
+                        "fut_meta=%d price_scale=%s",
+                        bucket_id,
+                        len(futures_candle_dicts),
+                        len(stock_candle_dicts),
+                        len(fut_meta),
+                        price_scale,
+                    )
                     await db_writer.enqueue(
                         "futures_3m",
                         {
@@ -1158,6 +1197,41 @@ async def run_interval_scheduler(
                     )
                 except Exception as exc:
                     log.exception("failed enqueueing futures_3m bucket_id=%s: %s", bucket_id, exc)
+            # ── options_data (additive snapshot of the ATM option chain) ──
+            # Independent block: does not touch futures / order-book / stock
+            # logic above. Enqueues the same option_chain_view already built
+            # for the WebSocket broadcast so no extra aggregation is needed.
+            if db_writer is not None:
+                try:
+                    option_chain_view = list(state.option_chain_view)
+                    spot_for_opts = index_candle.get("close") or state.option_metrics.get("atm_strike")
+                    option_expiry = None
+                    try:
+                        from app.main import APP_STATE as _APP_STATE  # late import: avoid cycle
+
+                        _ing = _APP_STATE.get("ingestion") if isinstance(_APP_STATE, dict) else None
+                        _mgr = getattr(_ing, "instrument_manager", None)
+                        if _mgr is not None:
+                            option_expiry = _mgr.get_option_expiry()
+                    except Exception:
+                        option_expiry = None
+                    log.info(
+                        "OPTION_DB_ENQUEUE | bucket=%s chain_rows=%d expiry=%s spot=%s",
+                        bucket_id, len(option_chain_view), option_expiry, spot_for_opts,
+                    )
+                    await db_writer.enqueue(
+                        "options_3m",
+                        {
+                            "bucket_id": bucket_id,
+                            "bucket_end": bucket_end.isoformat(),
+                            "expiry": option_expiry,
+                            "underlying": "NIFTY",
+                            "spot": spot_for_opts,
+                            "chain": option_chain_view,
+                        },
+                    )
+                except Exception as exc:
+                    log.exception("failed enqueueing options_3m bucket_id=%s: %s", bucket_id, exc)
             try:
                 await hub.broadcast_json(msg)
             except Exception as exc:

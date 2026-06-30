@@ -117,9 +117,10 @@ gcloud run deploy $SERVICE_NAME `
   --memory=2Gi `
   --cpu=2 `
   --timeout=3600 `
-  --max-instances=10 `
-  --min-instances=0 `
-  --concurrency=80 `
+  --max-instances=1 `
+  --min-instances=1 `
+  --no-cpu-throttling `
+  --concurrency=1 `
   --set-env-vars="NUBRA_ENV=UAT,NUBRA_EXCHANGE=NSE,ENABLE_NUBRA_SOCKET=true,USE_DATABASE=false,USE_REDIS=false,LOG_LEVEL=INFO,ENVIRONMENT=production,STRIKE_RADIUS=15,CANDLE_INTERVAL_MINUTES=3,MARKET_TIMEZONE=Asia/Kolkata,SUBSCRIBE_SDK_OPTION_CHAIN=true,INITIAL_NIFTY_PRICE=22000.0" `
   --update-secrets="NUBRA_AUTH_TOKEN=nubra-auth-token:latest,NUBRA_X_DEVICE_ID=nubra-x-device-id:latest,NUBRA_SESSION_TOKEN=nubra-session-token:latest,PHONE_NO=nubra-phone:latest,MPIN=nubra-mpin:latest,NUBRA_TOTP_SECRET=nubra-totp-secret:latest" `
   --project=$PROJECT_ID

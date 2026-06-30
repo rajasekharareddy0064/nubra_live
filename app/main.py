@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import os
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Awaitable
 
@@ -18,6 +20,14 @@ from bootstrap_auth import bootstrap_auth
 
 load_project_env(".")
 # ---------------------------------------------------------------------------
+
+# Stable per-process identity. Cloud Run does not expose an instance id via
+# env, so we mint one at import time. A correctly configured SINGLETON service
+# must only ever show ONE of these UIDs across all logs for a given revision —
+# that is our proof that no sibling instances were spawned.
+INSTANCE_UID: str = uuid.uuid4().hex[:12]
+K_REVISION: str = os.getenv("K_REVISION", "local")
+K_SERVICE: str = os.getenv("K_SERVICE", "nubra-live")
 
 from app.ingestion.auth_client import run_session_refresh_loop
 from app.ingestion.nubra_socket import NubraIngestionService
@@ -67,17 +77,15 @@ async def _start_nubra_background(
     APP_STATE["ingestion_status"] = {"state": "starting", "error": None}
     APP_STATE["ingestion"] = ingestion
     try:
-        await asyncio.wait_for(ingestion.start(), timeout=45.0)
+        await ingestion.start()
         APP_STATE["ingestion_status"] = {"state": "ready", "error": None}
         logger.info("Nubra ingestion enabled")
-    except asyncio.TimeoutError:
-        APP_STATE["ingestion_status"] = {
-            "state": "timeout",
-            "error": "ingestion.start exceeded 45s",
-        }
-        logger.exception("Nubra ingestion startup timed out")
-        return
     except Exception as exc:
+        APP_STATE["ingestion_status"] = {
+            "state": "error",
+            "error": repr(exc),
+        }
+        logger.exception("Nubra ingestion startup failed: %s", exc)
         APP_STATE["ingestion_status"] = {"state": "error", "error": repr(exc)}
         logger.exception("Nubra ingestion startup failed")
         return
@@ -140,6 +148,13 @@ async def lifespan(_: FastAPI):
     setup_logging(settings.log_level)
     load_project_env(".")
     logger = logging.getLogger("app.main")
+    logger.info(
+        "STARTUP_BEGIN | instance_uid=%s service=%s revision=%s mode=%s",
+        INSTANCE_UID,
+        K_SERVICE,
+        K_REVISION,
+        "simulation" if settings.is_simulation else ("live" if settings.enable_nubra_socket else "disabled"),
+    )
     logger.info("startup begin: configuring lightweight app state")
 
     tasks: list[asyncio.Task[Any]] = []
@@ -265,6 +280,7 @@ async def lifespan(_: FastAPI):
             APP_STATE["ingestion"] = svc
             nonlocal ingestion
             ingestion = svc
+            pipeline._ingestion = svc  # wire ingestion into pipeline so _price_scale() returns the correct value
             await _start_nubra_background(
                 svc,
                 env_name=settings.nubra_env,
@@ -287,9 +303,84 @@ async def lifespan(_: FastAPI):
         order_book_aggregator=order_book_aggregator,
     )
     _track_task(tasks, pipeline.run_forever(), name="RealtimePipeline.run", logger=logger)
-    _track_task(
-        tasks,
-        run_interval_scheduler(
+
+    # ── STARTUP GATE ──────────────────────────────────────────────────
+    # The 3-minute scheduler must NOT run until the instrument master is
+    # loaded and the three reference maps (opt/fut/stock) are populated.
+    # Starting early is exactly what produced empty / zero order-book
+    # snapshots: ticks arrive but every ref_id is unresolved, so the
+    # aggregator stays empty and the scheduler writes zero rows.
+    live_mode = settings.enable_nubra_socket and not settings.is_simulation
+
+    async def _gated_interval_scheduler() -> None:
+        gate_log = logging.getLogger("realtime.scheduler.gate")
+        if live_mode:
+            attempt = 0
+            while True:
+                attempt += 1
+                ing = pipeline._ingestion
+                state_status = APP_STATE.get("ingestion_status", {})
+                ingestion_state = state_status.get("state") if isinstance(state_status, dict) else None
+                if ing is None or getattr(ing, "instrument_manager", None) is None:
+                    gate_log.info(
+                        "STARTUP_GATE | uid=%s attempt=%d waiting reason=ingestion_not_ready ingestion_state=%s",
+                        INSTANCE_UID, attempt, ingestion_state,
+                    )
+                    await asyncio.sleep(2.0)
+                    continue
+                ms = ing.reference_map_status(pipeline._last_nifty)
+                if not ms["master_loaded"]:
+                    gate_log.warning(
+                        "STARTUP_GATE | uid=%s attempt=%d waiting reason=instrument_master_not_loaded",
+                        INSTANCE_UID, attempt,
+                    )
+                    await asyncio.sleep(2.0)
+                    continue
+                if ms["opt_map_size"] <= 0 or ms["fut_map_size"] <= 0 or ms["stock_map_size"] <= 0:
+                    gate_log.warning(
+                        "STARTUP_GATE | uid=%s attempt=%d waiting reason=empty_maps "
+                        "opt_map_size=%d fut_map_size=%d stock_map_size=%d "
+                        "(option_count=%d future_count=%d stock_count=%d)",
+                        INSTANCE_UID, attempt,
+                        ms["opt_map_size"], ms["fut_map_size"], ms["stock_map_size"],
+                        ms["option_count"], ms["future_count"], ms["stock_count"],
+                    )
+                    await asyncio.sleep(2.0)
+                    continue
+
+                # Maps are ready. Prime the pipeline's ref_maps now so the
+                # very first orderbook tick resolves (don't wait for a NIFTY
+                # spot tick to populate them lazily).
+                pipeline.refresh_ref_maps()
+                ws_connected = ingestion_state == "ready"
+                gate_log.info(
+                    "STARTUP_HEALTH | uid=%s | revision=%s | service=%s\n"
+                    "  instrument_master_loaded=%s (rows=%d)\n"
+                    "  option_count=%d | future_count=%d | stock_count=%d\n"
+                    "  opt_map_size=%d | fut_map_size=%d | stock_map_size=%d\n"
+                    "  websocket_connected=%s | scheduler_started=True | gate_attempts=%d",
+                    INSTANCE_UID, K_REVISION, K_SERVICE,
+                    ms["master_loaded"], ms["master_rows"],
+                    ms["option_count"], ms["future_count"], ms["stock_count"],
+                    ms["opt_map_size"], ms["fut_map_size"], ms["stock_map_size"],
+                    ws_connected, attempt,
+                )
+                APP_STATE["scheduler_gate"] = {
+                    "started": True,
+                    "instance_uid": INSTANCE_UID,
+                    "revision": K_REVISION,
+                    "attempts": attempt,
+                    "websocket_connected": ws_connected,
+                    **ms,
+                }
+                break
+        else:
+            gate_log.info(
+                "STARTUP_GATE | uid=%s non-live mode — starting scheduler immediately", INSTANCE_UID
+            )
+            APP_STATE["scheduler_gate"] = {"started": True, "instance_uid": INSTANCE_UID, "mode": "non_live"}
+
+        await run_interval_scheduler(
             hub,
             candles,
             market_state,
@@ -299,7 +390,12 @@ async def lifespan(_: FastAPI):
             nifty_ohlc_aggregator=nifty_ohlc_aggregator,
             order_book_aggregator=order_book_aggregator,
             db_writer=db_writer,
-        ),
+            instance_uid=INSTANCE_UID,
+        )
+
+    _track_task(
+        tasks,
+        _gated_interval_scheduler(),
         name="Candle3mScheduler",
         logger=logger,
     )
@@ -390,7 +486,11 @@ async def ready() -> dict[str, Any]:
     ingestion_status = APP_STATE.get("ingestion_status", {"state": "unknown"})
     return {
         "status": "ok",
+        "instance_uid": INSTANCE_UID,
+        "revision": K_REVISION,
+        "service": K_SERVICE,
         "startup_mode": APP_STATE.get("startup_mode"),
+        "scheduler_gate": APP_STATE.get("scheduler_gate", {"started": False}),
         "ingestion": ingestion_status,
         "auth": {
             "auth_dir": auth_state.get("auth_dir"),

@@ -10,3 +10,4 @@ python-dotenv
 pyotp
 google-cloud-secret-manager
 google-cloud-run
+google-cloud-storage

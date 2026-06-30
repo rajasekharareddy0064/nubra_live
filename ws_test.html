@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Nubra Live WebSocket</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Consolas', 'Monaco', monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; }
+        h1 { color: #00d4ff; margin-bottom: 10px; font-size: 1.4em; }
+        .status { padding: 8px 16px; border-radius: 4px; margin-bottom: 15px; font-weight: bold; }
+        .connected { background: #0a3d0a; color: #4cff4c; border: 1px solid #2d8b2d; }
+        .disconnected { background: #3d0a0a; color: #ff4c4c; border: 1px solid #8b2d2d; }
+        .connecting { background: #3d3d0a; color: #ffff4c; border: 1px solid #8b8b2d; }
+        .stats { display: flex; gap: 15px; flex-wrap: wrap; margin-bottom: 15px; }
+        .stat { background: #16213e; padding: 10px 15px; border-radius: 6px; border: 1px solid #2a4a7f; }
+        .stat .label { font-size: 0.75em; color: #888; text-transform: uppercase; }
+        .stat .value { font-size: 1.3em; color: #00d4ff; margin-top: 2px; }
+        .controls { margin-bottom: 15px; }
+        .controls button { padding: 8px 16px; margin-right: 8px; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9em; }
+        .btn-connect { background: #2d8b2d; color: white; }
+        .btn-disconnect { background: #8b2d2d; color: white; }
+        .btn-clear { background: #4a4a4a; color: white; }
+        #log { background: #0d1117; border: 1px solid #333; border-radius: 6px; padding: 10px; height: 500px; overflow-y: auto; font-size: 0.8em; line-height: 1.5; }
+        .msg { border-bottom: 1px solid #1a1a1a; padding: 4px 0; }
+        .msg-tick { color: #7fdbca; }
+        .msg-candle { color: #ffd700; font-weight: bold; }
+        .msg-option { color: #ff79c6; }
+        .msg-ping { color: #666; }
+        .msg-error { color: #ff4444; }
+        .timestamp { color: #555; margin-right: 8px; }
+    </style>
+</head>
+<body>
+    <h1>Nubra Live - WebSocket Monitor</h1>
+
+    <div id="statusBar" class="status disconnected">DISCONNECTED</div>
+
+    <div class="stats">
+        <div class="stat"><div class="label">Messages</div><div class="value" id="msgCount">0</div></div>
+        <div class="stat"><div class="label">Ticks</div><div class="value" id="tickCount">0</div></div>
+        <div class="stat"><div class="label">Candles</div><div class="value" id="candleCount">0</div></div>
+        <div class="stat"><div class="label">NIFTY</div><div class="value" id="niftyLtp">--</div></div>
+        <div class="stat"><div class="label">Rate/s</div><div class="value" id="msgRate">0</div></div>
+    </div>
+
+    <div class="controls">
+        <button class="btn-connect" onclick="connect()">Connect</button>
+        <button class="btn-disconnect" onclick="disconnect()">Disconnect</button>
+        <button class="btn-clear" onclick="clearLog()">Clear Log</button>
+        <label style="margin-left:15px;color:#888;">
+            <input type="checkbox" id="showTicks" checked> Show ticks
+        </label>
+        <label style="margin-left:10px;color:#888;">
+            <input type="checkbox" id="showPings"> Show pings
+        </label>
+    </div>
+
+    <div id="log"></div>
+
+    <script>
+        const WS_URL = 'wss://nubra-live-791197716058.asia-south1.run.app/ws/live';
+
+        let ws = null;
+        let msgCount = 0;
+        let tickCount = 0;
+        let candleCount = 0;
+        let rateWindow = [];
+
+        function updateStatus(text, cls) {
+            const bar = document.getElementById('statusBar');
+            bar.textContent = text;
+            bar.className = 'status ' + cls;
+        }
+
+        function log(text, cls = '') {
+            const el = document.getElementById('log');
+            const ts = new Date().toLocaleTimeString('en-IN', { hour12: false });
+            const div = document.createElement('div');
+            div.className = 'msg ' + cls;
+            div.innerHTML = `<span class="timestamp">${ts}</span>${text}`;
+            el.appendChild(div);
+            el.scrollTop = el.scrollHeight;
+            // Keep only last 500 messages
+            while (el.children.length > 500) el.removeChild(el.firstChild);
+        }
+
+        function connect() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                log('Already connected', 'msg-error');
+                return;
+            }
+            updateStatus('CONNECTING...', 'connecting');
+            log(`Connecting to ${WS_URL}...`);
+
+            ws = new WebSocket(WS_URL);
+
+            ws.onopen = () => {
+                updateStatus('CONNECTED', 'connected');
+                log('WebSocket connected!', 'msg-candle');
+            };
+
+            ws.onmessage = (event) => {
+                msgCount++;
+                rateWindow.push(Date.now());
+                document.getElementById('msgCount').textContent = msgCount;
+
+                try {
+                    const data = JSON.parse(event.data);
+                    handleMessage(data);
+                } catch (e) {
+                    log(`Raw: ${event.data.substring(0, 200)}`, 'msg-tick');
+                }
+            };
+
+            ws.onerror = (err) => {
+                log('WebSocket error', 'msg-error');
+            };
+
+            ws.onclose = (event) => {
+                updateStatus(`DISCONNECTED (code: ${event.code})`, 'disconnected');
+                log(`Disconnected: code=${event.code} reason=${event.reason || 'none'}`, 'msg-error');
+                ws = null;
+            };
+        }
+
+        function handleMessage(data) {
+            const type = data.type || 'unknown';
+
+            if (type === 'tick') {
+                tickCount++;
+                document.getElementById('tickCount').textContent = tickCount;
+                if (data.channel === 'index' && data.data && data.data.ltp) {
+                    document.getElementById('niftyLtp').textContent = data.data.ltp.toFixed(1);
+                }
+                if (document.getElementById('showTicks').checked) {
+                    const ch = data.channel || '';
+                    const key = data.key || '';
+                    const ltp = data.data?.ltp || data.data?.last_traded_price || '';
+                    log(`TICK ${ch}/${key} ltp=${ltp}`, 'msg-tick');
+                }
+            }
+            else if (type === 'candle_3m' || type === 'candle_3m_open') {
+                candleCount++;
+                document.getElementById('candleCount').textContent = candleCount;
+                const bucket = data.bucket_start || data.bucket_id || '';
+                const niftyClose = data.nifty?.close || data.meta?.index?.close || '';
+                const futures = Object.keys(data.futures || {}).length;
+                const stocks = Object.keys(data.stocks || {}).length;
+                log(`CANDLE ${type} bucket=${bucket} NIFTY=${niftyClose} futures=${futures} stocks=${stocks}`, 'msg-candle');
+            }
+            else if (type === 'option_chain') {
+                const chain = data.chain?.length || 0;
+                const atm = data.atm || '';
+                log(`OPTION_CHAIN atm=${atm} strikes=${chain} spot=${data.spot}`, 'msg-option');
+            }
+            else if (type === 'ws_ping' || type === 'pong') {
+                if (document.getElementById('showPings').checked) {
+                    log(`PING uptime=${data.uptime_seconds}s`, 'msg-ping');
+                }
+                // Send pong back to keep alive
+                if (ws && type === 'ws_ping') {
+                    ws.send(JSON.stringify({ type: 'ping', client_time: Date.now() / 1000 }));
+                }
+            }
+            else {
+                log(`${type}: ${JSON.stringify(data).substring(0, 150)}`, 'msg-tick');
+            }
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.close(1000, 'user-requested');
+                ws = null;
+            }
+        }
+
+        function clearLog() {
+            document.getElementById('log').innerHTML = '';
+        }
+
+        // Rate calculator
+        setInterval(() => {
+            const now = Date.now();
+            rateWindow = rateWindow.filter(t => now - t < 1000);
+            document.getElementById('msgRate').textContent = rateWindow.length;
+        }, 1000);
+
+        // Auto-connect on page load
+        connect();
+    </script>
+</body>
+</html>

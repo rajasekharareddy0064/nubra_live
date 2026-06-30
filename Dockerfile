@@ -32,6 +32,7 @@ RUN pip install --upgrade pip \
 COPY app ./app
 COPY jobs ./jobs
 COPY bootstrap_auth.py ./bootstrap_auth.py
+COPY instrument_master_cache.csv ./instrument_master_cache.csv
 
 # Non-root user
 RUN useradd --create-home --shell /bin/bash appuser \
