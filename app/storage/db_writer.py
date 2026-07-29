@@ -193,9 +193,9 @@ class DBWriter:
         )
 
         strike_count = len({row[2] for row in rows})
-        if strike_count < 10:
+        if strike_count < 21:
             self.logger.warning(
-                "order_book_3m_strikes insert has only %d strikes for timestamp=%s",
+                "order_book_3m_strikes insert has only %d strikes for timestamp=%s (expected ATM±10 = 21)",
                 strike_count,
                 rows[0][0],
             )
@@ -254,6 +254,7 @@ class DBWriter:
         now = datetime.now(timezone.utc)
         for payload in payloads:
             order_book = payload.get("order_book") if isinstance(payload.get("order_book"), dict) else {}
+            directional = order_book.get("directional") if isinstance(order_book.get("directional"), dict) else {}
             timestamp = self._timestamp(payload.get("bucket_end") or payload.get("timestamp"))
             rows.append(
                 (
@@ -270,6 +271,20 @@ class DBWriter:
                     self._num(order_book.get("breakout_score"), digits=2),
                     str(order_book.get("regime") or ""),
                     now,
+                    # Additive directional breakdown (from snapshot["directional"]).
+                    self._num(directional.get("ce_exec_delta")),
+                    self._num(directional.get("pe_exec_delta")),
+                    self._num(directional.get("ce_book_delta")),
+                    self._num(directional.get("pe_book_delta")),
+                    self._num(directional.get("ce_imbalance"), digits=4),
+                    self._num(directional.get("pe_imbalance"), digits=4),
+                    self._num(directional.get("ce_ask_removed")),
+                    self._num(directional.get("ce_bid_removed")),
+                    self._num(directional.get("pe_ask_removed")),
+                    self._num(directional.get("pe_bid_removed")),
+                    self._num(directional.get("bullish_pressure")),
+                    self._num(directional.get("bearish_pressure")),
+                    self._num(directional.get("net_pressure")),
                 )
             )
 
@@ -291,10 +306,24 @@ class DBWriter:
                 strike_shift,
                 score,
                 regime,
-                created_at
+                created_at,
+                ce_exec_delta,
+                pe_exec_delta,
+                ce_book_delta,
+                pe_book_delta,
+                ce_imbalance,
+                pe_imbalance,
+                ce_ask_removed,
+                ce_bid_removed,
+                pe_ask_removed,
+                pe_bid_removed,
+                bullish_pressure,
+                bearish_pressure,
+                net_pressure
             )
             VALUES (
-                $1::timestamp, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+                $1::timestamp, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26
             )
             ON CONFLICT ("timestamp") DO UPDATE SET
                 atm = EXCLUDED.atm,
@@ -308,7 +337,20 @@ class DBWriter:
                 strike_shift = EXCLUDED.strike_shift,
                 score = EXCLUDED.score,
                 regime = EXCLUDED.regime,
-                created_at = EXCLUDED.created_at
+                created_at = EXCLUDED.created_at,
+                ce_exec_delta = EXCLUDED.ce_exec_delta,
+                pe_exec_delta = EXCLUDED.pe_exec_delta,
+                ce_book_delta = EXCLUDED.ce_book_delta,
+                pe_book_delta = EXCLUDED.pe_book_delta,
+                ce_imbalance = EXCLUDED.ce_imbalance,
+                pe_imbalance = EXCLUDED.pe_imbalance,
+                ce_ask_removed = EXCLUDED.ce_ask_removed,
+                ce_bid_removed = EXCLUDED.ce_bid_removed,
+                pe_ask_removed = EXCLUDED.pe_ask_removed,
+                pe_bid_removed = EXCLUDED.pe_bid_removed,
+                bullish_pressure = EXCLUDED.bullish_pressure,
+                bearish_pressure = EXCLUDED.bearish_pressure,
+                net_pressure = EXCLUDED.net_pressure
             """,
             rows,
         )
@@ -758,6 +800,26 @@ class DBWriter:
                 ON {self.order_book_candle_table} ("timestamp" DESC);
                 """
             )
+            # Additive directional columns (CE/PE breakdown + net pressures).
+            # Existing columns/semantics are untouched; old rows stay NULL.
+            await conn.execute(
+                f"""
+                ALTER TABLE {self.order_book_candle_table}
+                    ADD COLUMN IF NOT EXISTS ce_exec_delta   NUMERIC(18,2),
+                    ADD COLUMN IF NOT EXISTS pe_exec_delta   NUMERIC(18,2),
+                    ADD COLUMN IF NOT EXISTS ce_book_delta   NUMERIC(18,2),
+                    ADD COLUMN IF NOT EXISTS pe_book_delta   NUMERIC(18,2),
+                    ADD COLUMN IF NOT EXISTS ce_imbalance    NUMERIC(10,4),
+                    ADD COLUMN IF NOT EXISTS pe_imbalance    NUMERIC(10,4),
+                    ADD COLUMN IF NOT EXISTS ce_ask_removed  NUMERIC(18,2),
+                    ADD COLUMN IF NOT EXISTS ce_bid_removed  NUMERIC(18,2),
+                    ADD COLUMN IF NOT EXISTS pe_ask_removed  NUMERIC(18,2),
+                    ADD COLUMN IF NOT EXISTS pe_bid_removed  NUMERIC(18,2),
+                    ADD COLUMN IF NOT EXISTS bullish_pressure NUMERIC(18,2),
+                    ADD COLUMN IF NOT EXISTS bearish_pressure NUMERIC(18,2),
+                    ADD COLUMN IF NOT EXISTS net_pressure     NUMERIC(18,2);
+                """
+            )
             await conn.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {self.futures_data_table} (
@@ -863,7 +925,8 @@ class DBWriter:
         return dt.astimezone(IST).replace(tzinfo=None)
 
     @staticmethod
-    def _normalize_strike_rows(order_book: dict[str, Any], *, min_strikes: int = 10) -> list[dict[str, Any]]:
+    def _normalize_strike_rows(order_book: dict[str, Any], *, min_strikes: int = 21) -> list[dict[str, Any]]:
+        """Ensure ATM ±10 (21 strikes at 50-pt step) before DB insert."""
         strikes = order_book.get("strikes") if isinstance(order_book.get("strikes"), list) else []
         rows = [row for row in strikes if isinstance(row, dict)]
         if len(rows) >= min_strikes:
@@ -876,7 +939,7 @@ class DBWriter:
             return rows
 
         step = 50
-        radius = math.ceil((min_strikes - 1) / 2)
+        radius = 10  # ATM ±10
         by_strike = {int(float(row.get("strike"))): row for row in rows if row.get("strike") is not None}
         padded: list[dict[str, Any]] = []
         for offset in range(-radius, radius + 1):

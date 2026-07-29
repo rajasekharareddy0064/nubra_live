@@ -30,4 +30,12 @@ def seconds_until_next_boundary(now: datetime, interval_minutes: int, tz: ZoneIn
     current_start = floor_to_interval(now, interval_minutes, tz)
     next_start = current_start + timedelta(minutes=interval_minutes)
     delta = (next_start - now.astimezone(tz)).total_seconds()
-    return max(0.01, delta)
+    # Small post-boundary buffer so asyncio.sleep() undershoot does not wake
+    # ~1ms early and cause closed_bucket_start to target the previous bar.
+    return max(0.05, delta + 0.05)
+
+
+def next_interval_boundary(now: datetime, interval_minutes: int, tz: ZoneInfo) -> datetime:
+    """Wall-clock time when the current interval bucket closes."""
+    current_start = floor_to_interval(now, interval_minutes, tz)
+    return current_start + timedelta(minutes=interval_minutes)

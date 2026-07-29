@@ -18,6 +18,7 @@ from app.realtime.interval_clock import (
     closed_bucket_start,
     floor_to_interval,
     market_tz,
+    next_interval_boundary,
     seconds_until_next_boundary,
 )
 from app.realtime.market_state import MarketStateStore
@@ -26,6 +27,36 @@ from app.realtime.option_summary import stock_futures_strength, summarize_option
 from app.realtime.order_book import OrderBookAggregator
 from app.realtime.options_chain import STRIKE_RADIUS as OPTION_CHAIN_RADIUS
 from app.realtime.options_chain import OptionsChainBuilder
+
+_DEBUG_LOG_PATH = __import__("pathlib").Path(__file__).resolve().parents[2] / "debug-de637c.log"
+
+
+def _agent_debug_log(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict[str, Any],
+    *,
+    run_id: str = "pre-fix",
+) -> None:
+    # #region agent log
+    try:
+        import json
+
+        entry = {
+            "sessionId": "de637c",
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with _DEBUG_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, default=str) + "\n")
+    except Exception:
+        pass
+    # #endregion
 
 if TYPE_CHECKING:
     from app.ingestion.nubra_socket import NubraIngestionService
@@ -910,7 +941,22 @@ async def run_interval_scheduler(
     from datetime import timedelta
 
     while True:
-        delay = seconds_until_next_boundary(datetime.now(tz), interval_minutes, tz)
+        loop_wake_at = datetime.now(tz)
+        delay = seconds_until_next_boundary(loop_wake_at, interval_minutes, tz)
+        target_boundary = next_interval_boundary(loop_wake_at, interval_minutes, tz)
+        # #region agent log
+        _agent_debug_log(
+            "H-A",
+            "pipeline.py:scheduler:sleep",
+            "scheduler sleeping until next boundary",
+            {
+                "wake_at": loop_wake_at.isoformat(),
+                "delay_sec": round(delay, 3),
+                "target_boundary": target_boundary.isoformat(),
+                "last_emitted_start": last_emitted_start.isoformat() if last_emitted_start else None,
+            },
+        )
+        # #endregion
         if debug_state is not None:
             now_for_debug = datetime.now(tz)
             debug_state.update(
@@ -926,18 +972,69 @@ async def run_interval_scheduler(
                 }
             )
         await asyncio.sleep(delay)
+        # Ensure we are at or past the boundary before picking the closed bar.
+        # Without this, waking ~1ms early makes closed_bucket_start() return the
+        # previous bar (already emitted) → duplicate skip → next bar missed.
+        while datetime.now(tz) < target_boundary:
+            await asyncio.sleep(0.01)
+        iter_start_mono = time.monotonic()
         try:
             if debug_state is not None:
                 debug_state.update({"status": "building", "last_error": None})
             now = datetime.now(tz)
+            # #region agent log
+            _agent_debug_log(
+                "H-A",
+                "pipeline.py:scheduler:boundary_reached",
+                "past target boundary before bucket selection",
+                {
+                    "now": now.isoformat(),
+                    "target_boundary": target_boundary.isoformat(),
+                    "late_ms": round((now - target_boundary).total_seconds() * 1000, 1),
+                },
+            )
+            # #endregion
             # Bar that just closed at `now` (e.g. now=12:06:00 → [12:03, 12:06)).
             bucket_start = closed_bucket_start(now, interval_minutes, tz)
             bucket_end = bucket_start + timedelta(minutes=interval_minutes)
             bucket_id = f"{bucket_start.isoformat()}:{interval_minutes}m"
+            if last_emitted_start is not None:
+                gap_minutes = (bucket_start - last_emitted_start).total_seconds() / 60.0
+                if gap_minutes > interval_minutes:
+                    missed = int(gap_minutes / interval_minutes) - 1
+                    # #region agent log
+                    _agent_debug_log(
+                        "H-A",
+                        "pipeline.py:scheduler:gap",
+                        "detected missing bucket gap before emit attempt",
+                        {
+                            "now": now.isoformat(),
+                            "bucket_start": bucket_start.isoformat(),
+                            "last_emitted_start": last_emitted_start.isoformat(),
+                            "gap_minutes": gap_minutes,
+                            "estimated_missed_buckets": missed,
+                            "sleep_late_sec": (now - loop_wake_at - timedelta(seconds=delay)).total_seconds(),
+                        },
+                    )
+                    # #endregion
             if bucket_id in emitted_bucket_ids or (
                 last_emitted_start is not None and bucket_start == last_emitted_start
             ):
                 log.warning("duplicate candle bucket skipped bucket_id=%s", bucket_id)
+                # #region agent log
+                _agent_debug_log(
+                    "H-B",
+                    "pipeline.py:scheduler:duplicate_skip",
+                    "duplicate candle bucket skipped",
+                    {
+                        "bucket_id": bucket_id,
+                        "bucket_start": bucket_start.isoformat(),
+                        "in_emitted_set": bucket_id in emitted_bucket_ids,
+                        "same_as_last": last_emitted_start == bucket_start if last_emitted_start else False,
+                        "now": now.isoformat(),
+                    },
+                )
+                # #endregion
                 if debug_state is not None:
                     debug_state.update(
                         {
@@ -1236,6 +1333,19 @@ async def run_interval_scheduler(
                 await hub.broadcast_json(msg)
             except Exception as exc:
                 log.exception("candle emit failed: %s", exc)
+                # #region agent log
+                _agent_debug_log(
+                    "H-D",
+                    "pipeline.py:scheduler:broadcast_fail",
+                    "broadcast failed; bucket marked emitted but reset skipped",
+                    {
+                        "bucket_id": bucket_id,
+                        "bucket_start": bucket_start.isoformat(),
+                        "error": repr(exc),
+                        "processing_sec": round(time.monotonic() - iter_start_mono, 3),
+                    },
+                )
+                # #endregion
                 if debug_state is not None:
                     debug_state.update(
                         {
@@ -1260,6 +1370,21 @@ async def run_interval_scheduler(
                         "last_stocks_count": len(stock_candle_dicts),
                     }
                 )
+            # #region agent log
+            _agent_debug_log(
+                "H-A",
+                "pipeline.py:scheduler:emitted",
+                "candle emitted successfully",
+                {
+                    "bucket_id": bucket_id,
+                    "bucket_start": bucket_start.isoformat(),
+                    "bucket_end": bucket_end.isoformat(),
+                    "now": now.isoformat(),
+                    "processing_sec": round(time.monotonic() - iter_start_mono, 3),
+                    "index_tick_count": index_candle.get("tick_count"),
+                },
+            )
+            # #endregion
             candle_board.reset_all()
 
             # Immediately announce the new bar that has just opened so
@@ -1291,4 +1416,16 @@ async def run_interval_scheduler(
                         "last_error_at": datetime.now(tz).isoformat(),
                     }
                 )
+            # #region agent log
+            _agent_debug_log(
+                "H-C",
+                "pipeline.py:scheduler:iteration_error",
+                "scheduler iteration failed before/during emit",
+                {
+                    "error": repr(exc),
+                    "processing_sec": round(time.monotonic() - iter_start_mono, 3),
+                    "last_emitted_start": last_emitted_start.isoformat() if last_emitted_start else None,
+                },
+            )
+            # #endregion
             log.exception("candle interval scheduler iteration failed (will retry next boundary)")

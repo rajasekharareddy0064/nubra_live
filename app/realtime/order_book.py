@@ -12,7 +12,9 @@ from app.realtime.options_chain import STRIKE_RADIUS, STRIKE_STEP, get_atm_strik
 
 logger = logging.getLogger(__name__)
 
-MIN_EMIT_STRIKES = 10
+# ATM ±10 at 50-pt step → 21 strike rows in websocket + DB.
+MIN_EMIT_STRIKES = 21
+EMIT_RADIUS = 10
 
 
 def _f(value: Any) -> float:
@@ -96,8 +98,8 @@ def _normalize_trade_side(value: Any) -> str:
 
 @dataclass
 class _SideAggregate:
-    bid_qty_sum: float = 0.0
-    ask_qty_sum: float = 0.0
+    bid_qty_avg_sum: float = 0.0
+    ask_qty_avg_sum: float = 0.0
     buy_qty_sum: float = 0.0
     sell_qty_sum: float = 0.0
     volume_sum: float = 0.0
@@ -130,8 +132,8 @@ class _SideAggregate:
             self.ask_removed_sum += max(self.last_ask_qty - ask_qty, 0.0)
         if self.last_bid_qty is not None:
             self.bid_removed_sum += max(self.last_bid_qty - bid_qty, 0.0)
-        self.bid_qty_sum += bid_qty
-        self.ask_qty_sum += ask_qty
+        self.bid_qty_avg_sum += bid_qty
+        self.ask_qty_avg_sum += ask_qty
         self.buy_qty_sum += buy_qty
         self.sell_qty_sum += sell_qty
         self.volume_sum += volume
@@ -151,22 +153,28 @@ class _SideAggregate:
 
     def to_dict(self) -> dict[str, Any]:
         exec_delta = self.buy_qty_sum - self.sell_qty_sum
-        book_delta = self.bid_qty_sum - self.ask_qty_sum
-        imbalance_denominator = self.bid_qty_sum + self.ask_qty_sum
+        last_bid = self.last_bid_qty or 0.0
+        last_ask = self.last_ask_qty or 0.0
+        book_delta = last_bid - last_ask
+        imbalance_denominator = last_bid + last_ask
         imbalance = (
-            (self.bid_qty_sum - self.ask_qty_sum) / imbalance_denominator
+            (last_bid - last_ask) / imbalance_denominator
             if imbalance_denominator > 0
             else 0.0
         )
         avg_spread = (self.spread_sum / self.spread_count) if self.spread_count else 0.0
+        avg_bid = (self.bid_qty_avg_sum / self.samples) if self.samples else 0.0
+        avg_ask = (self.ask_qty_avg_sum / self.samples) if self.samples else 0.0
         return {
-            "bid_qty_sum": _round(self.bid_qty_sum) or 0.0,
-            "ask_qty_sum": _round(self.ask_qty_sum) or 0.0,
+            "bid_qty_sum": _round(last_bid) or 0.0,
+            "ask_qty_sum": _round(last_ask) or 0.0,
+            "last_bid_qty": _round(last_bid) or 0.0,
+            "last_ask_qty": _round(last_ask) or 0.0,
             "buy_qty_sum": _round(self.buy_qty_sum) or 0.0,
             "sell_qty_sum": _round(self.sell_qty_sum) or 0.0,
             "volume_sum": _round(self.volume_sum) or 0.0,
-            "avg_bid_qty": _round(self.bid_qty_sum / self.samples) if self.samples else 0.0,
-            "avg_ask_qty": _round(self.ask_qty_sum / self.samples) if self.samples else 0.0,
+            "avg_bid_qty": _round(avg_bid) or 0.0,
+            "avg_ask_qty": _round(avg_ask) or 0.0,
             "total_buy_qty": _round(self.buy_qty_sum) or 0.0,
             "total_sell_qty": _round(self.sell_qty_sum) or 0.0,
             "exec_delta": _round(exec_delta) or 0.0,
@@ -200,12 +208,12 @@ class OrderBookAggregator:
         self,
         *,
         strike_radius: int = 10,
-        emit_radius: int = STRIKE_RADIUS,
+        emit_radius: int = EMIT_RADIUS,
         strike_step: int = STRIKE_STEP,
     ) -> None:
         self._strike_radius = strike_radius
         self._emit_radius = emit_radius
-        self._strike_step = strike_step        # always in RUPEES (50)
+        self._strike_step = strike_step  # always in RUPEES (50)
         self._atm: int | None = None           # stored in RUPEES
         self._strikes: dict[int, _StrikeAggregate] = {}  # keys in RUPEES
         self._spread_history: deque[float] = deque(maxlen=30)
@@ -273,18 +281,19 @@ class OrderBookAggregator:
         oi = _f(_pick(payload, "oi", "open_interest", "openInterest"))
         oi_change = _f(_pick(payload, "oi_change", "oiChange", "open_interest_change", "openInterestChange"))
         trade_side = _normalize_trade_side(_pick(payload, "trade_side", "tradeSide", "side"))
+        inferred_trade_side = False
         if buy_qty <= 0 and sell_qty <= 0:
             if trade_side == "BUY":
                 buy_qty = traded_qty
             elif trade_side == "SELL":
                 sell_qty = traded_qty
             else:
+                inferred_trade_side = traded_qty > 0
                 buy_qty = traded_qty if bid_qty >= ask_qty else 0.0
                 sell_qty = traded_qty if ask_qty > bid_qty else 0.0
 
         async with self._lock:
-            # ATM and strike_rupees are both in rupees — comparison is correct.
-            if self._atm is None and candidate_atm is not None:
+            if candidate_atm is not None:
                 self._atm = candidate_atm
             atm = self._atm or candidate_atm
             selected = bool(
@@ -322,6 +331,15 @@ class OrderBookAggregator:
                 oi=oi,
                 oi_change=oi_change,
             )
+            if inferred_trade_side and traded_qty > 0:
+                logger.debug(
+                    "orderbook inferred trade side strike=%s side=%s traded=%s bid=%s ask=%s",
+                    strike_rupees,
+                    side,
+                    traded_qty,
+                    bid_qty,
+                    ask_qty,
+                )
             self._log_update(
                 bucket_id=bucket_id,
                 atm=atm,
@@ -343,8 +361,7 @@ class OrderBookAggregator:
         options_by_strike: dict[Any, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         # atm_source is in RUPEES (from pipeline._last_nifty).
-        # self._atm is also in RUPEES. Both use the same scale.
-        atm = self._atm or get_atm_strike(float(atm_source or 0), step=self._strike_step)
+        atm = get_atm_strike(float(atm_source or 0), step=self._strike_step) or self._atm
         async with self._lock:
             snapshot = self._snapshot_locked(atm, options_by_strike or {})
             self._atm = None
@@ -407,6 +424,13 @@ class OrderBookAggregator:
         total_bid_removed = 0.0
         spread_sum = 0.0
         spread_count = 0
+        # Per-side (CE/PE) accumulators. CE and PE are kept fully separate
+        # here so they can be combined with their correct directional sign
+        # (CE bullish, PE bearish) instead of being summed blindly.
+        ce_buy = ce_sell = ce_bid = ce_ask = 0.0
+        pe_buy = pe_sell = pe_bid = pe_ask = 0.0
+        ce_ask_removed = ce_bid_removed = 0.0
+        pe_ask_removed = pe_bid_removed = 0.0
         rows: list[dict[str, Any]] = []
         activity_by_strike: dict[int, float] = {}
         breakout_by_strike: dict[int, float] = {}
@@ -415,50 +439,113 @@ class OrderBookAggregator:
             if strike in internal_strikes:
                 activity_by_strike[strike] = self._activity_score(strike, atm, aggregate)
                 breakout_by_strike[strike] = self._breakout_loading_score(strike, atm, aggregate)
-        metric_strikes = [
-            strike
-            for strike, _score in sorted(activity_by_strike.items(), key=lambda item: item[1], reverse=True)[:20]
-        ]
-        if not metric_strikes:
-            metric_strikes = selected_strikes
 
-        for strike in metric_strikes:
-            aggregate = self._strikes.get(strike, _StrikeAggregate())
+        for strike in internal_strikes:
+            aggregate = self._strikes.get(strike)
+            if aggregate is None:
+                continue
             ce = aggregate.ce
             pe = aggregate.pe
+            ce_buy += ce.buy_qty_sum
+            ce_sell += ce.sell_qty_sum
+            ce_bid += ce.last_bid_qty or 0.0
+            ce_ask += ce.last_ask_qty or 0.0
+            ce_ask_removed += ce.ask_removed_sum
+            ce_bid_removed += ce.bid_removed_sum
+            pe_buy += pe.buy_qty_sum
+            pe_sell += pe.sell_qty_sum
+            pe_bid += pe.last_bid_qty or 0.0
+            pe_ask += pe.last_ask_qty or 0.0
+            pe_ask_removed += pe.ask_removed_sum
+            pe_bid_removed += pe.bid_removed_sum
             for side in (ce, pe):
-                total_bid_qty += side.bid_qty_sum
-                total_ask_qty += side.ask_qty_sum
-                total_buy_qty += side.buy_qty_sum
-                total_sell_qty += side.sell_qty_sum
-                total_ask_removed += side.ask_removed_sum
-                total_bid_removed += side.bid_removed_sum
                 spread_sum += side.spread_sum
                 spread_count += side.spread_count
 
+        # Gross totals (CE+PE) for summary / emptiness check.
+        total_bid_qty = ce_bid + pe_bid
+        total_ask_qty = ce_ask + pe_ask
+        total_buy_qty = ce_buy + pe_buy
+        total_sell_qty = ce_sell + pe_sell
+        total_ask_removed = ce_ask_removed + pe_ask_removed
+        total_bid_removed = ce_bid_removed + pe_bid_removed
+
         for strike in selected_strikes:
             aggregate = self._strikes.get(strike)
-            has_data = aggregate is not None
-            ce_dict = aggregate.ce.to_dict() if has_data else {}
-            pe_dict = aggregate.pe.to_dict() if has_data else {}
+            if aggregate is None:
+                rows.append(
+                    {
+                        "strike": strike,
+                        "has_data": False,
+                        "ce_has_data": False,
+                        "pe_has_data": False,
+                        "tick_count": 0,
+                        "ce": {},
+                        "pe": {},
+                    }
+                )
+                continue
+            ce_dict = aggregate.ce.to_dict()
+            pe_dict = aggregate.pe.to_dict()
+            ce_has_data = aggregate.ce.samples > 0
+            pe_has_data = aggregate.pe.samples > 0
             rows.append(
                 {
                     "strike": strike,
-                    "has_data": has_data,
-                    "tick_count": (aggregate.ce.samples + aggregate.pe.samples) if has_data else 0,
+                    "has_data": ce_has_data or pe_has_data,
+                    "ce_has_data": ce_has_data,
+                    "pe_has_data": pe_has_data,
+                    "tick_count": aggregate.ce.samples + aggregate.pe.samples,
                     "ce": ce_dict,
                     "pe": pe_dict,
                 }
             )
 
-        exec_delta = total_buy_qty - total_sell_qty
-        book_delta = total_bid_qty - total_ask_qty
-        candle_has_data = total_bid_qty > 0 or total_buy_qty > 0 or total_ask_removed > 0
-        imbalance_denominator = total_bid_qty + total_ask_qty
-        imbalance = (
-            (total_bid_qty - total_ask_qty) / imbalance_denominator
-            if imbalance_denominator > 0
-            else 0.0
+        # ── Directional interpretation (CE bullish, PE bearish) ─────────
+        # Raw per-side signed metrics. Retained as debug fields so future
+        # classifiers (call/put buying vs writing, hedging, delta/gamma
+        # hedging) need no further redesign.
+        ce_exec_delta = ce_buy - ce_sell
+        pe_exec_delta = pe_buy - pe_sell
+        ce_book_delta = ce_bid - ce_ask
+        pe_book_delta = pe_bid - pe_ask
+        ce_imb_denom = ce_bid + ce_ask
+        pe_imb_denom = pe_bid + pe_ask
+        ce_imbalance = (ce_bid - ce_ask) / ce_imb_denom if ce_imb_denom > 0 else 0.0
+        pe_imbalance = (pe_bid - pe_ask) / pe_imb_denom if pe_imb_denom > 0 else 0.0
+
+        # Net market direction: CE contributes bullish, PE contributes bearish.
+        #   net = CE side - PE side
+        net_exec = ce_exec_delta - pe_exec_delta
+        net_book_delta = ce_book_delta - pe_book_delta
+        # Keep net_imbalance in [-1, 1] so the unchanged score formula
+        # (which clips imbalance to [-1, 1]) behaves identically.
+        net_imbalance = (ce_imbalance - pe_imbalance) / 2.0
+
+        # Directional liquidity buckets:
+        #   bullish = calls lifted (CE ask removed) + put bids pulled (PE bid removed)
+        #   bearish = puts lifted  (PE ask removed) + call bids pulled (CE bid removed)
+        bullish_liquidity = ce_ask_removed + pe_bid_removed
+        bearish_liquidity = pe_ask_removed + ce_bid_removed
+
+        # Informational directional pressures (debug only — NOT fed to score).
+        bullish_exec = max(ce_exec_delta, 0.0) + max(-pe_exec_delta, 0.0)
+        bearish_exec = max(pe_exec_delta, 0.0) + max(-ce_exec_delta, 0.0)
+        bullish_pressure = bullish_exec + max(net_book_delta, 0.0) + bullish_liquidity
+        bearish_pressure = bearish_exec + max(-net_book_delta, 0.0) + bearish_liquidity
+        net_pressure = bullish_pressure - bearish_pressure
+
+        # These NET values are what feed the (unchanged) breakout score,
+        # rolling history and the exposed exec_delta / book_delta / imbalance.
+        exec_delta = net_exec
+        book_delta = net_book_delta
+        imbalance = net_imbalance
+
+        candle_has_data = (
+            total_bid_qty > 0
+            or total_buy_qty > 0
+            or total_ask_removed > 0
+            or total_bid_removed > 0
         )
         avg_spread = spread_sum / spread_count if spread_count else 0.0
         spread_zscore = self._zscore(avg_spread, self._spread_history)
@@ -474,7 +561,7 @@ class OrderBookAggregator:
 
         self._rolling_exec_delta_30.append(exec_delta)
         self._rolling_book_delta_30.append(book_delta)
-        self._rolling_ask_removed_30.append(total_ask_removed)
+        self._rolling_ask_removed_30.append(bullish_liquidity)
         cum_exec_delta_30 = sum(self._rolling_exec_delta_30)
         cum_book_delta_30 = sum(self._rolling_book_delta_30)
         cum_ask_removed_30 = sum(self._rolling_ask_removed_30)
@@ -482,8 +569,8 @@ class OrderBookAggregator:
         breakout_score = self._breakout_score(
             exec_delta=exec_delta,
             book_delta=book_delta,
-            ask_removed=total_ask_removed,
-            bid_removed=total_bid_removed,
+            ask_removed=bullish_liquidity,
+            bid_removed=bearish_liquidity,
             imbalance=imbalance,
             cum_exec_delta_30=cum_exec_delta_30,
             cum_book_delta_30=cum_book_delta_30,
@@ -500,8 +587,8 @@ class OrderBookAggregator:
         self._append_metric_history(
             avg_spread=avg_spread,
             exec_delta=exec_delta,
-            ask_removed=total_ask_removed,
-            bid_removed=total_bid_removed,
+            ask_removed=bullish_liquidity,
+            bid_removed=bearish_liquidity,
             book_delta=book_delta,
             cum_exec_delta_30=cum_exec_delta_30,
             cum_book_delta_30=cum_book_delta_30,
@@ -518,11 +605,14 @@ class OrderBookAggregator:
             "activity_strike": activity_strike,
             "breakout_strike": breakout_strike,
             "strike_shift": _round(strike_shift) or 0.0,
+            # exec_delta / book_delta / imbalance / ask_removed / bid_removed
+            # now carry NET MARKET DIRECTION (CE bullish − PE bearish),
+            # not a blind CE+PE sum. Keys and types are unchanged.
             "exec_delta": _round(exec_delta) or 0.0,
             "book_delta": _round(book_delta) or 0.0,
             "imbalance": _round(imbalance) or 0.0,
-            "ask_removed": _round(total_ask_removed) or 0.0,
-            "bid_removed": _round(total_bid_removed) or 0.0,
+            "ask_removed": _round(bullish_liquidity) or 0.0,
+            "bid_removed": _round(bearish_liquidity) or 0.0,
             "spread_zscore": _round(spread_zscore) or 0.0,
             "cum_exec_delta_30": _round(cum_exec_delta_30) or 0.0,
             "cum_book_delta_30": _round(cum_book_delta_30) or 0.0,
@@ -531,6 +621,31 @@ class OrderBookAggregator:
             "active_strike_shift": _round(strike_shift) or 0.0,
             "breakout_score": _round(breakout_score, 2) or 0.0,
             "regime": regime,
+            # ── Directional debug metrics (additive) ────────────────────
+            # Raw per-side CE/PE metrics + net breakdown retained so future
+            # classifiers (call/put buying vs writing, hedging, delta/gamma
+            # hedging) need no further redesign. Existing DB writers read
+            # only the fixed keys above, so these are safely ignored there.
+            "directional": {
+                "ce_exec_delta": _round(ce_exec_delta) or 0.0,
+                "pe_exec_delta": _round(pe_exec_delta) or 0.0,
+                "ce_book_delta": _round(ce_book_delta) or 0.0,
+                "pe_book_delta": _round(pe_book_delta) or 0.0,
+                "ce_imbalance": _round(ce_imbalance) or 0.0,
+                "pe_imbalance": _round(pe_imbalance) or 0.0,
+                "ce_ask_removed": _round(ce_ask_removed) or 0.0,
+                "ce_bid_removed": _round(ce_bid_removed) or 0.0,
+                "pe_ask_removed": _round(pe_ask_removed) or 0.0,
+                "pe_bid_removed": _round(pe_bid_removed) or 0.0,
+                "net_exec": _round(net_exec) or 0.0,
+                "net_book_delta": _round(net_book_delta) or 0.0,
+                "net_imbalance": _round(net_imbalance) or 0.0,
+                "bullish_liquidity": _round(bullish_liquidity) or 0.0,
+                "bearish_liquidity": _round(bearish_liquidity) or 0.0,
+                "bullish_pressure": _round(bullish_pressure) or 0.0,
+                "bearish_pressure": _round(bearish_pressure) or 0.0,
+                "net_pressure": _round(net_pressure) or 0.0,
+            },
             "summary": {
                 "total_bid_qty": _round(total_bid_qty) or 0.0,
                 "total_ask_qty": _round(total_ask_qty) or 0.0,
@@ -540,8 +655,10 @@ class OrderBookAggregator:
                 "book_delta": _round(book_delta) or 0.0,
                 "delta": _round(exec_delta) or 0.0,
                 "imbalance": _round(imbalance) or 0.0,
-                "ask_removed": _round(total_ask_removed) or 0.0,
-                "bid_removed": _round(total_bid_removed) or 0.0,
+                "ask_removed": _round(bullish_liquidity) or 0.0,
+                "bid_removed": _round(bearish_liquidity) or 0.0,
+                "gross_ask_removed": _round(total_ask_removed) or 0.0,
+                "gross_bid_removed": _round(total_bid_removed) or 0.0,
                 "avg_spread": _round(avg_spread) or 0.0,
                 "spread_zscore": _round(spread_zscore) or 0.0,
             },
@@ -575,7 +692,9 @@ class OrderBookAggregator:
         exec_delta = 0.0
         for side in (aggregate.ce, aggregate.pe):
             executed_qty += side.buy_qty_sum + side.sell_qty_sum
-            book_delta += abs(side.bid_qty_sum - side.ask_qty_sum)
+            last_bid = side.last_bid_qty or 0.0
+            last_ask = side.last_ask_qty or 0.0
+            book_delta += abs(last_bid - last_ask)
             volume += side.volume_sum
             exec_delta += abs(side.buy_qty_sum - side.sell_qty_sum)
         raw_score = executed_qty + book_delta + volume + exec_delta
