@@ -392,7 +392,7 @@ class OrderBookAggregator:
         sell_qty: float,
         current_delta: float,
     ) -> None:
-        logger.info(
+        logger.debug(
             "order_book aggregate %s",
             {
                 "bucket_id": bucket_id,

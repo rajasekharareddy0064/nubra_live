@@ -44,7 +44,7 @@ steps:
       # Singleton ingestion: one in-flight request slot. Prevents Cloud Run
       # from using request concurrency as a signal to spin up siblings.
       - '--concurrency=1'
-      - '--set-env-vars=NUBRA_ENV=PROD,NUBRA_EXCHANGE=NSE,ENABLE_NUBRA_SOCKET=true,USE_DATABASE=true,USE_REDIS=false,LOG_LEVEL=INFO,ENVIRONMENT=production,STRIKE_RADIUS=15,CANDLE_INTERVAL_MINUTES=3,MARKET_TIMEZONE=Asia/Kolkata,SUBSCRIBE_SDK_OPTION_CHAIN=true,INITIAL_NIFTY_PRICE=24500.0,DB_SCHEMA=trading_data,POSTGRES_DSN=postgresql://postgres:Welcome6720@/tradingdb?host=/cloudsql/stock-anaysis:asia-south1:tradingmigration'
+      - '--set-env-vars=NUBRA_ENV=PROD,NUBRA_EXCHANGE=NSE,ENABLE_NUBRA_SOCKET=true,USE_DATABASE=true,USE_REDIS=false,LOG_LEVEL=WARNING,ENVIRONMENT=production,STRIKE_RADIUS=15,CANDLE_INTERVAL_MINUTES=3,MARKET_TIMEZONE=Asia/Kolkata,SUBSCRIBE_SDK_OPTION_CHAIN=true,INITIAL_NIFTY_PRICE=24500.0,DB_SCHEMA=trading_data,POSTGRES_DSN=postgresql://postgres:Welcome6720@/tradingdb?host=/cloudsql/stock-anaysis:asia-south1:tradingmigration'
       - '--add-cloudsql-instances=stock-anaysis:asia-south1:tradingmigration'
       - '--update-secrets=NUBRA_AUTH_TOKEN=nubra-auth-token:latest,NUBRA_X_DEVICE_ID=nubra-x-device-id:latest,NUBRA_SESSION_TOKEN=nubra-session-token:latest,PHONE_NO=PHONE_NO:latest,MPIN=MPIN:latest,NUBRA_TOTP_SECRET=NUBRA_TOTP_SECRET:latest'
 
