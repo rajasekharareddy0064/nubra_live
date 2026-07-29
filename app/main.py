@@ -13,6 +13,7 @@ from app.api.ws import router as ws_router
 from app.core.config import settings
 from app.core.env_loader import load_project_env
 from app.core.logging import setup_logging
+from app.instruments.nifty50 import NIFTY50_SYMBOL_COUNT
 from bootstrap_auth import bootstrap_auth
 
 # --- Non-interactive bootstrap ----------------------------------------------
@@ -340,10 +341,24 @@ async def lifespan(_: FastAPI):
                     gate_log.warning(
                         "STARTUP_GATE | uid=%s attempt=%d waiting reason=empty_maps "
                         "opt_map_size=%d fut_map_size=%d stock_map_size=%d "
-                        "(option_count=%d future_count=%d stock_count=%d)",
+                        "(option_count=%d future_count=%d stock_count=%d expected_stock_count=%d)",
                         INSTANCE_UID, attempt,
                         ms["opt_map_size"], ms["fut_map_size"], ms["stock_map_size"],
                         ms["option_count"], ms["future_count"], ms["stock_count"],
+                        ms.get("expected_stock_count", NIFTY50_SYMBOL_COUNT),
+                    )
+                    await asyncio.sleep(2.0)
+                    continue
+                if not ms.get("stock_count_ok"):
+                    gate_log.warning(
+                        "STARTUP_GATE | uid=%s attempt=%d waiting reason=nifty50_incomplete "
+                        "stock_count=%d stock_map_size=%d expected=%d missing=%s",
+                        INSTANCE_UID,
+                        attempt,
+                        ms["stock_count"],
+                        ms["stock_map_size"],
+                        ms.get("expected_stock_count", NIFTY50_SYMBOL_COUNT),
+                        ms.get("missing_stock_symbols") or [],
                     )
                     await asyncio.sleep(2.0)
                     continue
@@ -356,13 +371,16 @@ async def lifespan(_: FastAPI):
                 gate_log.info(
                     "STARTUP_HEALTH | uid=%s | revision=%s | service=%s\n"
                     "  instrument_master_loaded=%s (rows=%d)\n"
-                    "  option_count=%d | future_count=%d | stock_count=%d\n"
+                    "  option_count=%d | future_count=%d | stock_count=%d | expected_stock_count=%d\n"
                     "  opt_map_size=%d | fut_map_size=%d | stock_map_size=%d\n"
+                    "  missing_stock_symbols=%s\n"
                     "  websocket_connected=%s | scheduler_started=True | gate_attempts=%d",
                     INSTANCE_UID, K_REVISION, K_SERVICE,
                     ms["master_loaded"], ms["master_rows"],
                     ms["option_count"], ms["future_count"], ms["stock_count"],
+                    ms.get("expected_stock_count", NIFTY50_SYMBOL_COUNT),
                     ms["opt_map_size"], ms["fut_map_size"], ms["stock_map_size"],
+                    ms.get("missing_stock_symbols") or [],
                     ws_connected, attempt,
                 )
                 APP_STATE["scheduler_gate"] = {

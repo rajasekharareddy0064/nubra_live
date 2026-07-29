@@ -9,12 +9,9 @@ import numpy as np
 import pandas as pd
 
 
-NIFTY50_WEIGHTS: dict[str, float] = {
-    "HDFCBANK": 13.3,
-    "RELIANCE": 8.8,
-    "ICICIBANK": 8.4,
-    "INFY": 5.1,
-}
+from app.instruments.nifty50 import NIFTY50_WEIGHTS as _NIFTY50_WEIGHTS
+
+NIFTY50_WEIGHTS: dict[str, float] = dict(_NIFTY50_WEIGHTS)
 
 NIFTY50_SECTORS: dict[str, str] = {
     "HDFCBANK": "Financial Services",

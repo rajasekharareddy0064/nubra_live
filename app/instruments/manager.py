@@ -57,18 +57,13 @@ class SubscriptionDiff:
     current: list[int]
 
 
-DEFAULT_NIFTY50_SYMBOLS = {
-    "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
-    "BAJAJ-AUTO", "BAJAJFINSV", "BAJFINANCE", "BEL", "BHARTIARTL",
-    "BPCL", "BRITANNIA", "CIPLA", "COALINDIA", "DRREDDY",
-    "EICHERMOT", "ETERNAL", "GRASIM", "HCLTECH", "HDFCBANK",
-    "HDFCLIFE", "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK",
-    "INDUSINDBK", "INFY", "ITC", "JIOFIN", "JSWSTEEL",
-    "KOTAKBANK", "LT", "MARUTI", "M&M", "NESTLEIND",
-    "NTPC", "ONGC", "POWERGRID", "RELIANCE", "SBILIFE",
-    "SBIN", "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM", "TATASTEEL",
-    "TCS", "TECHM", "TITAN", "ULTRACEMCO",
-}
+from app.instruments.nifty50 import (
+    DEFAULT_NIFTY50_SYMBOLS,
+    NIFTY50_SYMBOL_COUNT,
+    NIFTY50_SYMBOLS,
+    nifty50_canonical_symbol,
+    nifty50_master_assets,
+)
 
 
 class InstrumentManager:
@@ -110,6 +105,8 @@ class InstrumentManager:
         self._nifty_fut_contract_by_ref: dict[int, str] = {}
         self._nifty_fut_symbol_by_ref: dict[int, str] = {}
         self._fut_by_symbol: dict[str, dict[str, Any]] = {}
+        self._stock_fut_refs: list[int] = []
+        self._stock_fut_assets: set[str] = set()
 
         self.df: pd.DataFrame = self._load_instruments()
         self._prepare_indices()
@@ -420,7 +417,7 @@ class InstrumentManager:
         ``opt_map`` (option ref→strike/side), ``fut_map`` (NIFTY future
         ref→symbol) and ``stock_map`` (stock future ref→symbol). The
         startup gate refuses to launch the 3-minute scheduler until all
-        three are > 0.
+        three are > 0 and all configured NIFTY50 stock futures are resolved.
         """
         master_loaded = self.df is not None and not self.df.empty
         try:
@@ -433,15 +430,26 @@ class InstrumentManager:
             maps = self.get_ref_maps(px)
         except Exception:
             maps = {}
+        expected_stock_count = len(self.nifty50_symbols) if self.nifty50_symbols else NIFTY50_SYMBOL_COUNT
+        missing_stock_symbols = sorted(self.nifty50_symbols - self._stock_fut_assets)
+        stock_count = len(self._stock_fut_refs)
+        stock_map_size = len(maps.get("stock_fut_symbols") or {})
         return {
             "master_loaded": bool(master_loaded),
             "master_rows": int(len(self.df)) if master_loaded else 0,
             "option_count": len(self._option_map),
             "future_count": len(self._nifty_fut_symbol_by_ref),
-            "stock_count": len(self._stock_fut_refs),
+            "stock_count": stock_count,
+            "expected_stock_count": expected_stock_count,
+            "missing_stock_symbols": missing_stock_symbols,
+            "stock_count_ok": (
+                stock_count == expected_stock_count
+                and stock_map_size == expected_stock_count
+                and not missing_stock_symbols
+            ),
             "opt_map_size": len(maps.get("option_by_ref") or {}),
             "fut_map_size": len(maps.get("nifty_fut_symbol_by_ref") or {}),
-            "stock_map_size": len(maps.get("stock_fut_symbols") or {}),
+            "stock_map_size": stock_map_size,
         }
 
     # ----------------------------
@@ -694,9 +702,29 @@ class InstrumentManager:
             & (df["asset_type"] == "STOCK_FO")
         ].copy()
         if self.nifty50_symbols:
-            stock_fut = stock_fut[stock_fut["asset"].isin(self.nifty50_symbols)]
+            master_assets = nifty50_master_assets(self.nifty50_symbols)
+            stock_fut = stock_fut[stock_fut["asset"].isin(master_assets)]
         stock_fut = self._prefer_non_expired_per_asset(stock_fut, today)
-        self._stock_fut_refs = stock_fut["ref_id"].head(50).tolist()
+        stock_fut = stock_fut.drop_duplicates(subset=["asset"], keep="first")
+        expected_count = len(self.nifty50_symbols) if self.nifty50_symbols else NIFTY50_SYMBOL_COUNT
+        selected = stock_fut.head(expected_count)
+        self._stock_fut_refs = [int(ref) for ref in selected["ref_id"].tolist()]
+        self._stock_fut_assets = {
+            nifty50_canonical_symbol(str(asset))
+            for asset in selected["asset"].tolist()
+            if str(asset).strip()
+        }
+        self._stock_fut_assets = {
+            asset for asset in self._stock_fut_assets if asset in self.nifty50_symbols
+        }
+        if len(self._stock_fut_refs) != expected_count:
+            missing = sorted(self.nifty50_symbols - self._stock_fut_assets)
+            self.logger.warning(
+                "NIFTY50 stock futures incomplete | resolved=%d expected=%d missing=%s",
+                len(self._stock_fut_refs),
+                expected_count,
+                missing,
+            )
 
         # Resolve symbols for index stream (index + futures).
         ref_to_symbol = (
@@ -824,8 +852,9 @@ class InstrumentManager:
                 ts = pd.Timestamp(exp_dt).normalize()
                 expiry_text = ts.strftime("%Y-%m-%d")
                 expiry_py = ts.to_pydatetime()
+            asset = str(row.get("asset") or "").strip().upper()
             out[sym] = {
-                "underlying_symbol": str(row.get("asset") or "").strip().upper(),
+                "underlying_symbol": nifty50_canonical_symbol(asset),
                 "expiry": expiry_text,
                 "expiry_dt": expiry_py,
                 "instrument_type": "FUT",

@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from app.core.config import settings
+from app.instruments.nifty50 import NIFTY50_SYMBOLS_SORTED, NIFTY50_UNDERLYINGS, nifty50_canonical_symbol
 from app.queue.broker import QueueBroker
 from app.queue.envelope import EventEnvelope
 from app.realtime.analytics import VolatilityService, build_analytics_snapshot
@@ -159,19 +160,6 @@ def _normalize_option_rows(raw: Any) -> list[dict[str, Any]]:
 def _norm_symbol(x: Any) -> str:
     return str(x or "").strip().upper()
 
-
-NIFTY50_UNDERLYINGS = {
-    "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
-    "BAJAJ-AUTO", "BAJAJFINSV", "BAJFINANCE", "BEL", "BHARTIARTL",
-    "BPCL", "BRITANNIA", "CIPLA", "COALINDIA", "DRREDDY",
-    "EICHERMOT", "ETERNAL", "GRASIM", "HCLTECH", "HDFCBANK",
-    "HDFCLIFE", "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK",
-    "INDUSINDBK", "INFY", "ITC", "JIOFIN", "JSWSTEEL",
-    "KOTAKBANK", "LT", "MARUTI", "M&M", "NESTLEIND",
-    "NTPC", "ONGC", "POWERGRID", "RELIANCE", "SBILIFE",
-    "SBIN", "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM", "TATASTEEL",
-    "TCS", "TECHM", "TITAN", "ULTRACEMCO",
-}
 
 HIGH_LIQUID = {"RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "SBIN"}
 
@@ -426,7 +414,7 @@ class RealtimePipeline:
         existing["symbol"] = symbol
         self.state.stock_futures[symbol] = existing
 
-        underlying = _get_underlying(symbol)
+        underlying = nifty50_canonical_symbol(_get_underlying(symbol))
         under_state = dict(self.state.stock_futures_by_underlying.get(underlying) or {})
         for k in ("ltp", "oi", "volume", "cum_volume", "timestamp", "raw", "symbol"):
             if k in existing:
@@ -1289,7 +1277,7 @@ async def run_interval_scheduler(
                             "futures": futures_candle_dicts,
                             "stocks": stock_candle_dicts,
                             "fut_meta": fut_meta,
-                            "nifty50_underlyings": sorted(NIFTY50_UNDERLYINGS),
+                            "nifty50_underlyings": list(NIFTY50_SYMBOLS_SORTED),
                         },
                     )
                 except Exception as exc:
