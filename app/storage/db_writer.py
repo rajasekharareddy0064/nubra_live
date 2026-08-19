@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
+from app.realtime.options_chain import MIN_CHAIN_STRIKES, STRIKE_RADIUS, filter_chain_to_radius
+
 IST = ZoneInfo("Asia/Kolkata")
 
 
@@ -41,6 +43,9 @@ class DBWriter:
         self.futures_data_table = f"{self._q(self.schema)}.{self._q('futures_data')}"
         self.nifty50_stock_futures_table = f"{self._q(self.schema)}.{self._q('nifty50_stock_futures')}"
         self.options_data_table = f"{self._q(self.schema)}.{self._q('options_data')}"
+        self.market_ohlc_table = f"{self._q(self.schema)}.{self._q('market_ohlc')}"
+        self.market_ohlc_3m_table = f"{self._q(self.schema)}.{self._q('market_ohlc_3m')}"
+        self.nifty50_stock_ohlc_table = f"{self._q(self.schema)}.{self._q('nifty50_stock_ohlc')}"
 
     async def connect(self) -> None:
         self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=5)
@@ -106,6 +111,10 @@ class DBWriter:
             options_rows = batches.pop("options_3m", [])
             if options_rows:
                 await self._insert_options_data(conn, options_rows)
+
+            market_ohlc_rows = batches.pop("market_ohlc_bundle", [])
+            if market_ohlc_rows:
+                await self._insert_market_ohlc_bundle(conn, market_ohlc_rows)
 
             rows: list[tuple[str, str, datetime]] = []
             now = datetime.now(timezone.utc)
@@ -559,20 +568,37 @@ class DBWriter:
             return "ITM" if spot > strike else "OTM"
         return "ITM" if spot < strike else "OTM"
 
+    @staticmethod
+    def _grow_option_symbol(expiry_date: Any, strike: int, side: str) -> str:
+        """Match Grow historical symbol format, e.g. NIFTY2672124550CE."""
+        yy = int(expiry_date.year) % 100
+        return f"NIFTY{yy}{int(expiry_date.month)}{int(expiry_date.day)}{int(strike)}{str(side).upper()}"
+
+    @staticmethod
+    def _opt_price_rupees(value: Any) -> float | None:
+        """Normalize option prices to rupees for Grow-compatible storage."""
+        if value is None:
+            return None
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            return None
+        if price <= 0:
+            return None
+        # Feed premiums often arrive in paise; Grow rows are rupees (e.g. 18.25).
+        if price >= 500:
+            return price / 100.0
+        return price
+
     async def _insert_options_data(
         self,
         conn: asyncpg.Connection,
         payloads: list[dict[str, Any]],
     ) -> None:
-        """Persist a per-bar snapshot of the ATM option chain into options_data.
+        """Persist per-bar NIFTY option candles into options_data (Grow format).
 
-        Source is ``state.option_chain_view`` (one entry per strike, each
-        carrying CE/PE legs). Prices are stored in RUPEES to match the rest
-        of the nubra-live system (futures_data / order_book_3m), NOT the
-        paise convention of the retired legacy writer. There is no per-option
-        OHLC accumulation in this pipeline, so open/high/low/close are set to
-        the snapshot LTP (a flat point-in-time bar). Greeks/IV/OI are the
-        latest snapshot values (correctly NOT aggregated).
+        Uses tick-aggregated OHLCV when available; falls back to chain snapshot.
+        Prices are stored in RUPEES to match Grow historical rows.
         """
         rows: list[tuple[Any, ...]] = []
         rows_received = 0
@@ -580,28 +606,57 @@ class DBWriter:
         skipped_no_price = 0
         for payload in payloads:
             chain = payload.get("chain") if isinstance(payload.get("chain"), list) else []
+            option_candles = payload.get("option_candles") if isinstance(payload.get("option_candles"), dict) else {}
             timestamp = self._timestamp(payload.get("bucket_end") or payload.get("timestamp"))
             expiry = str(payload.get("expiry") or "").strip()
             underlying = str(payload.get("underlying") or "NIFTY").strip().upper()
-            spot = self._opt_leg_val(payload, "spot")
+            spot_raw = self._opt_leg_val(payload, "spot")
+            spot = self._opt_price_rupees(spot_raw) if spot_raw is not None else None
             if not expiry:
                 skipped_no_expiry += 1
                 self.logger.warning(
                     "OPTION_DB_FAILED | reason=missing_expiry bucket=%s rows_in_chain=%d",
-                    payload.get("bucket_end"), len(chain),
+                    payload.get("bucket_end"),
+                    len(chain),
                 )
                 continue
-            # asyncpg binds DATE params as datetime.date, not str.
             try:
                 expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
             except (TypeError, ValueError):
                 skipped_no_expiry += 1
                 self.logger.warning(
                     "OPTION_DB_FAILED | reason=bad_expiry expiry=%r bucket=%s",
-                    expiry, payload.get("bucket_end"),
+                    expiry,
+                    payload.get("bucket_end"),
                 )
                 continue
-            expiry_compact = expiry.replace("-", "")
+            chain = filter_chain_to_radius(chain, spot, radius=STRIKE_RADIUS)
+            if spot and spot > 0:
+                strikes_in_chain = {
+                    int(round(float(row.get("strike"))))
+                    for row in chain
+                    if isinstance(row, dict) and row.get("strike") is not None
+                }
+                if len(strikes_in_chain) < MIN_CHAIN_STRIKES:
+                    self.logger.warning(
+                        "options_data insert has only %d strikes for timestamp=%s "
+                        "(expected ATM±%d = %d; spot=%s)",
+                        len(strikes_in_chain),
+                        payload.get("bucket_end"),
+                        STRIKE_RADIUS,
+                        MIN_CHAIN_STRIKES,
+                        spot,
+                    )
+            allowed_keys = {
+                f"{int(round(float(row.get('strike'))))}:{side}"
+                for row in chain
+                if isinstance(row, dict) and row.get("strike") is not None
+                for side in ("CE", "PE")
+                if isinstance(row.get(side), dict) and row.get(side)
+            }
+            option_candles = {
+                k: v for k, v in option_candles.items() if k in allowed_keys
+            }
             for crow in chain:
                 if not isinstance(crow, dict):
                     continue
@@ -614,43 +669,57 @@ class DBWriter:
                     if not isinstance(leg, dict) or not leg:
                         continue
                     rows_received += 1
-                    ltp = self._opt_leg_val(leg, "ltp", "last_price", "close")
-                    if ltp is None or ltp <= 0:
+                    candle_key = f"{strike}:{side}"
+                    agg = option_candles.get(candle_key) if isinstance(option_candles.get(candle_key), dict) else None
+                    if agg and not agg.get("is_empty") and agg.get("close"):
+                        open_p = self._opt_price_rupees(agg.get("open"))
+                        high_p = self._opt_price_rupees(agg.get("high"))
+                        low_p = self._opt_price_rupees(agg.get("low"))
+                        close_p = self._opt_price_rupees(agg.get("close"))
+                        volume = agg.get("volume")
+                        oi = agg.get("oi")
+                    else:
+                        ltp = self._opt_leg_val(leg, "ltp", "last_price", "close")
+                        open_p = high_p = low_p = close_p = self._opt_price_rupees(ltp)
+                        volume = self._opt_leg_val(leg, "volume", "traded_volume", "tradedVolume")
+                        oi = self._opt_leg_val(leg, "oi", "open_interest", "openInterest")
+                    if close_p is None or close_p <= 0:
                         skipped_no_price += 1
                         continue
-                    volume = self._opt_leg_val(leg, "volume", "traded_volume", "tradedVolume")
-                    oi = self._opt_leg_val(leg, "oi", "open_interest", "openInterest")
+                    open_p = open_p if open_p is not None else close_p
+                    high_p = high_p if high_p is not None else close_p
+                    low_p = low_p if low_p is not None else close_p
                     delta = self._opt_leg_val(leg, "delta")
                     gamma = self._opt_leg_val(leg, "gamma")
                     theta = self._opt_leg_val(leg, "theta")
                     vega = self._opt_leg_val(leg, "vega")
                     iv = self._opt_leg_val(leg, "iv")
-                    symbol = f"NIFTY{expiry_compact}{strike}{side}"
-                    price = self._num(ltp)
+                    symbol = self._grow_option_symbol(expiry_date, strike, side)
+                    strike_rs = float(strike)
                     rows.append(
                         (
-                            timestamp,                       # 1  timestamp
-                            symbol,                          # 2  symbol
-                            expiry_date,                     # 3  expiry (date)
-                            self._num(strike),               # 4  strike
-                            side,                            # 5  option_type
-                            price,                           # 6  open
-                            price,                           # 7  high
-                            price,                           # 8  low
-                            price,                           # 9  close
-                            self._wire_int(volume, 1.0),     # 10 volume (bigint)
-                            self._wire_int(oi, 1.0),         # 11 oi (bigint)
-                            self._num(theta, digits=6),      # 12 theta
-                            self._num(delta, digits=6),      # 13 delta
-                            self._num(gamma, digits=6),      # 14 gamma
-                            self._num(vega, digits=6),       # 15 vega
-                            self._num(iv, digits=6),         # 16 iv
-                            "OPT",                           # 17 instrument_type
-                            None,                            # 18 iv_mid
-                            float(ltp),                      # 19 ltp (double precision)
-                            underlying,                      # 20 underlying_symbol
-                            self._opt_moneyness(side, strike, spot),  # 21 moneyness
-                            (float(strike) - spot) if spot else None,  # 22 spot_distance
+                            timestamp,
+                            symbol,
+                            expiry_date,
+                            self._num(strike_rs),
+                            side,
+                            self._num(open_p),
+                            self._num(high_p),
+                            self._num(low_p),
+                            self._num(close_p),
+                            self._wire_int(volume, 1.0),
+                            self._wire_int(oi, 1.0),
+                            self._num(theta, digits=6),
+                            self._num(delta, digits=6),
+                            self._num(gamma, digits=6),
+                            self._num(vega, digits=6),
+                            self._num(iv, digits=6),
+                            "OPT",
+                            None,
+                            float(close_p),
+                            underlying,
+                            self._opt_moneyness(side, int(round(strike_rs)), spot),
+                            (float(strike_rs) - spot) if spot else None,
                         )
                     )
 
@@ -703,6 +772,102 @@ class DBWriter:
         except Exception as exc:
             self.logger.exception("OPTION_DB_FAILED | error=%s", exc)
             raise
+
+    async def _insert_market_ohlc_bundle(
+        self,
+        conn: asyncpg.Connection,
+        payloads: list[dict[str, Any]],
+    ) -> None:
+        """Write NIFTY spot to market_ohlc; NIFTY50 cash to market_ohlc_3m only."""
+        market_rows: list[tuple[Any, ...]] = []
+        market_3m_rows: list[tuple[Any, ...]] = []
+        created_at = datetime.now(IST).replace(tzinfo=None)
+        for payload in payloads:
+            timestamp = self._timestamp(payload.get("bucket_end") or payload.get("timestamp"))
+            nifty = payload.get("nifty") if isinstance(payload.get("nifty"), dict) else {}
+            stock_spots = payload.get("stock_spots") if isinstance(payload.get("stock_spots"), dict) else {}
+            stock_eq_meta = (
+                payload.get("stock_eq_meta") if isinstance(payload.get("stock_eq_meta"), dict) else {}
+            )
+            close = nifty.get("close")
+            if close is not None and float(close) > 0:
+                open_p = self._num(nifty.get("open"))
+                high_p = self._num(nifty.get("high"))
+                low_p = self._num(nifty.get("low"))
+                close_p = self._num(close)
+                volume = self._wire_int(nifty.get("volume"), 1.0)
+                market_rows.append(
+                    ("NIFTY", "3m", timestamp, open_p, high_p, low_p, close_p, volume, created_at)
+                )
+            for sym, candle in stock_spots.items():
+                if not isinstance(candle, dict) or candle.get("is_empty"):
+                    continue
+                symbol = str(sym).strip().upper()
+                if not symbol or float(candle.get("close") or 0) <= 0:
+                    continue
+                meta = stock_eq_meta.get(symbol) if isinstance(stock_eq_meta.get(symbol), dict) else {}
+                open_p = self._num(candle.get("open"))
+                high_p = self._num(candle.get("high"))
+                low_p = self._num(candle.get("low"))
+                close_p = self._num(candle.get("close"))
+                volume = self._wire_int(candle.get("volume"), 1.0)
+                market_3m_rows.append(
+                    (
+                        symbol,
+                        meta.get("symbol_token"),
+                        str(meta.get("exchange") or "NSE").strip().upper(),
+                        str(meta.get("instrument_type") or "STOCK").strip().upper(),
+                        "3m",
+                        timestamp,
+                        open_p,
+                        high_p,
+                        low_p,
+                        close_p,
+                        volume,
+                        created_at,
+                    )
+                )
+
+        if market_rows:
+            await conn.executemany(
+                f"""
+                INSERT INTO {self.market_ohlc_table} (
+                    symbol, interval, "timestamp", open, high, low, close, volume, created_at
+                )
+                VALUES ($1, $2, $3::timestamp, $4, $5, $6, $7, $8, $9::timestamp)
+                """,
+                market_rows,
+            )
+        if market_3m_rows:
+            await conn.executemany(
+                f"""
+                INSERT INTO {self.market_ohlc_3m_table} (
+                    symbol, symbol_token, exchange, instrument_type, interval,
+                    candle_time, open, high, low, close, volume, created_at
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5,
+                    $6::timestamp, $7, $8, $9, $10, $11, $12::timestamp
+                )
+                ON CONFLICT (symbol, candle_time) DO UPDATE SET
+                    symbol_token = EXCLUDED.symbol_token,
+                    exchange = EXCLUDED.exchange,
+                    instrument_type = EXCLUDED.instrument_type,
+                    interval = EXCLUDED.interval,
+                    open = EXCLUDED.open,
+                    high = EXCLUDED.high,
+                    low = EXCLUDED.low,
+                    close = EXCLUDED.close,
+                    volume = EXCLUDED.volume,
+                    created_at = EXCLUDED.created_at
+                """,
+                market_3m_rows,
+            )
+        self.logger.info(
+            "MARKET_OHLC_INSERT | market_ohlc=%d market_ohlc_3m=%d",
+            len(market_rows),
+            len(market_3m_rows),
+        )
 
     async def _ensure_table(self) -> None:
         if not self.pool:

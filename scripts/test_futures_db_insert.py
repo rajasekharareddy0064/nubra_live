@@ -21,7 +21,7 @@ async def main() -> None:
     bucket_end_naive = bucket_end.replace(tzinfo=None)
     payload = {
         "bucket_end": bucket_end_naive.isoformat(),
-        "price_scale": 100.0,
+        "price_scale": 1.0,
         "futures": {
             "NIFTY26JUNFUT": {
                 "open": 24071.9,

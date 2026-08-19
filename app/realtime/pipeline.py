@@ -18,6 +18,7 @@ from app.realtime.hub import LiveHub
 from app.realtime.interval_clock import (
     closed_bucket_start,
     floor_to_interval,
+    is_nse_cash_session_bar,
     market_tz,
     next_interval_boundary,
     seconds_until_next_boundary,
@@ -28,36 +29,6 @@ from app.realtime.option_summary import stock_futures_strength, summarize_option
 from app.realtime.order_book import OrderBookAggregator
 from app.realtime.options_chain import STRIKE_RADIUS as OPTION_CHAIN_RADIUS
 from app.realtime.options_chain import OptionsChainBuilder
-
-_DEBUG_LOG_PATH = __import__("pathlib").Path(__file__).resolve().parents[2] / "debug-de637c.log"
-
-
-def _agent_debug_log(
-    hypothesis_id: str,
-    location: str,
-    message: str,
-    data: dict[str, Any],
-    *,
-    run_id: str = "pre-fix",
-) -> None:
-    # #region agent log
-    try:
-        import json
-
-        entry = {
-            "sessionId": "de637c",
-            "runId": run_id,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with _DEBUG_LOG_PATH.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, default=str) + "\n")
-    except Exception:
-        pass
-    # #endregion
 
 if TYPE_CHECKING:
     from app.ingestion.nubra_socket import NubraIngestionService
@@ -285,7 +256,7 @@ class RealtimePipeline:
         # ``state.option_chain_view`` / ``state.option_metrics`` so the
         # 3-min scheduler and the /realtime/candles/current endpoint
         # can read the same in-memory snapshot without re-aggregating.
-        self._options_chain_builder = OptionsChainBuilder()
+        self._options_chain_builder = OptionsChainBuilder(radius=settings.option_emit_radius)
 
     def refresh_ref_maps(self) -> None:
         if not self._ingestion or not self._ingestion.instrument_manager:
@@ -309,9 +280,9 @@ class RealtimePipeline:
             return 1.0
         return scale_f if scale_f > 0 else 1.0
 
-    def _to_rupees(self, price: Any) -> float:
+    def _to_rupees(self, price: Any, *, kind: str = "INDEX") -> float:
         from app.core.price_utils import normalize_price
-        return normalize_price(price, scale=self._price_scale(), module="pipeline")
+        return normalize_price(price, scale=self._price_scale(), kind=kind, module="pipeline")
 
     def _primary_nifty_fut_symbol(self) -> str | None:
         refs = self._ref_maps.get("nifty_fut_refs") or []
@@ -371,6 +342,41 @@ class RealtimePipeline:
         self._prev_volume_by_symbol[symbol] = current_volume
         print(symbol, "RAW:", current_volume, "DELTA:", delta)
         return delta
+
+    def _update_option_candle(
+        self,
+        strike: int,
+        side: str,
+        ltp: float,
+        volume: float | None,
+        oi: float | None,
+    ) -> None:
+        side_norm = str(side).upper()
+        if side_norm not in {"CE", "PE"} or ltp <= 0:
+            return
+        vol_key = f"OPT_{int(strike)}_{side_norm}"
+        candle = self.candles.ensure_option(strike, side_norm)
+        vol_add = self._volume_from_candle_start(vol_key, volume, candle)
+        candle.update(
+            ltp,
+            vol_add,
+            oi=_f(oi) if oi is not None else None,
+            cum_volume=_f(volume) if volume is not None else None,
+        )
+
+    def _update_stock_spot_candle(
+        self,
+        symbol: str,
+        ltp: float,
+        volume: float | None,
+    ) -> None:
+        sym = nifty50_canonical_symbol(str(symbol).strip().upper())
+        if sym not in NIFTY50_UNDERLYINGS or ltp <= 0:
+            return
+        vol_key = f"SPOT_{sym}"
+        candle = self.candles.ensure_stock_spot(sym)
+        vol_add = self._volume_from_candle_start(vol_key, volume, candle)
+        candle.update(ltp, vol_add, cum_volume=_f(volume) if volume is not None else None)
 
     def _volume_from_candle_start(self, symbol: str, current_volume: float | None, candle: Any) -> float:
         """
@@ -465,7 +471,6 @@ class RealtimePipeline:
         # broadcasts) sees prices on the same scale as
         # state.options_by_strike keys. Volume / OI are NOT scaled —
         # they are contract counts, not prices.
-        ltp = self._to_rupees(normalized["ltp"])
         vol = normalized["volume"]
         oi = normalized["oi"]
         symbol = _norm_symbol(payload.get("indexname") or payload.get("symbol") or normalized["symbol"] or "NIFTY")
@@ -474,7 +479,15 @@ class RealtimePipeline:
             print("No volume field for:", symbol)
         vol_delta = self._volume_delta(symbol, vol)
         is_futures = symbol.endswith("FUT")
-        if not is_futures:
+        canon = nifty50_canonical_symbol(symbol)
+        if is_futures:
+            price_kind = "FUT"
+        elif canon in NIFTY50_UNDERLYINGS:
+            price_kind = "STOCK"
+        else:
+            price_kind = "INDEX"
+        ltp = self._to_rupees(normalized["ltp"], kind=price_kind)
+        if symbol == "NIFTY" and not is_futures:
             self.state.nifty_index = {
                 "symbol": symbol,
                 "ltp": ltp,
@@ -505,6 +518,19 @@ class RealtimePipeline:
             # NIFTY tick. The builder internally throttles to 500ms
             # (or fires immediately on ATM rolls), so this is cheap.
             await self._refresh_option_chain(emit=True)
+        # NIFTY50 cash equity ticks on the index stream (symbol = RELIANCE, not *FUT).
+        if not is_futures and symbol in NIFTY50_UNDERLYINGS:
+            if ltp > 0:
+                self._update_stock_spot_candle(symbol, ltp, _f(vol) if vol is not None else None)
+            spot_tick = {
+                "symbol": nifty50_canonical_symbol(symbol),
+                "ltp": ltp,
+                "volume": _f(vol),
+                "timestamp": payload.get("timestamp"),
+                "raw": normalized["raw"],
+            }
+            await self._emit_tick("index", f"STOCK:{symbol}", spot_tick)
+            return
         # Nubra index stream also emits futures symbols; use it as primary for futures OI/volume.
         if is_futures:
             print("RAW STOCK MSG:", payload)
@@ -564,7 +590,10 @@ class RealtimePipeline:
 
         ce = _normalize_option_rows(_pick(core, "ce", "CE", "call", "calls", "call_data", "callData"))
         pe = _normalize_option_rows(_pick(core, "pe", "PE", "put", "puts", "put_data", "putData"))
-        atm_hint = self._to_rupees(_pick(core, "at_the_money_strike", "atm", "atm_strike", "atmStrike"))
+        atm_hint = self._to_rupees(
+            _pick(core, "at_the_money_strike", "atm", "atm_strike", "atmStrike"),
+            kind="INDEX",
+        )
         # Strike values from the chain stream are typically already in
         # the master's domain (paise); convert them to rupees so they
         # match keys written by _on_orderbook. LTPs are scaled too.
@@ -579,7 +608,10 @@ class RealtimePipeline:
             leg = dict(existing or {})
             leg.update(
                 {
-                    "ltp": self._to_rupees(_pick(row, "ltp", "last_traded_price", "lastTradedPrice", "last_price")),
+                    "ltp": self._to_rupees(
+                        _pick(row, "ltp", "last_traded_price", "lastTradedPrice", "last_price"),
+                        kind="OPT",
+                    ),
                     "oi": _pick(row, "open_interest", "openInterest", "oi"),
                     "volume": _pick(row, "volume", "traded_volume", "tradedVolume"),
                     "delta": _pick(row, "delta"),
@@ -640,6 +672,20 @@ class RealtimePipeline:
             )
             or normalized.get("symbol")
         )
+        fut_symbol_map: dict[int, str] = self._ref_maps.get("nifty_fut_symbol_by_ref") or {}
+        stock_map: dict[int, str] = self._ref_maps.get("stock_fut_symbols") or {}
+        stock_eq_map: dict[int, str] = self._ref_maps.get("stock_eq_symbols") or {}
+        opt_map: dict[int, tuple[int, str]] = self._ref_maps.get("option_by_ref") or {}
+        opt_symbol_map: dict[int, str] = self._ref_maps.get("option_symbol_by_ref") or {}
+        state_option = _option_from_state_by_ref(self.state.options_by_strike, rid)
+        if rid in fut_symbol_map or rid in stock_map:
+            price_kind = "FUT"
+        elif rid in stock_eq_map:
+            price_kind = "STOCK"
+        elif rid in opt_map or state_option is not None:
+            price_kind = "OPT"
+        else:
+            price_kind = "INDEX"
         # Scale LTP to rupees at ingest. Volume / OI / quantities stay
         # raw because they are not prices.
         ltp = self._to_rupees(
@@ -650,7 +696,8 @@ class RealtimePipeline:
                 "ltp",
                 "last_price",
                 "lastPrice",
-            )
+            ),
+            kind=price_kind,
         )
         vol = _pick_num(
             core,
@@ -706,10 +753,6 @@ class RealtimePipeline:
             "asks": asks,
             "raw": normalized["raw"],
         }
-        fut_symbol_map: dict[int, str] = self._ref_maps.get("nifty_fut_symbol_by_ref") or {}
-        stock_map: dict[int, str] = self._ref_maps.get("stock_fut_symbols") or {}
-        opt_map: dict[int, tuple[int, str]] = self._ref_maps.get("option_by_ref") or {}
-        opt_symbol_map: dict[int, str] = self._ref_maps.get("option_symbol_by_ref") or {}
         direct_strike_raw = _pick_num(
             core,
             "strike",
@@ -725,7 +768,6 @@ class RealtimePipeline:
         direct_opt_type = _option_side(
             _pick(core, "option_type", "optionType", "opt_type", "optType", "right", "side")
         )
-        state_option = _option_from_state_by_ref(self.state.options_by_strike, rid)
 
         if rid in fut_symbol_map:
             symbol = _norm_symbol(fut_symbol_map[rid] or normalized.get("symbol"))
@@ -758,6 +800,11 @@ class RealtimePipeline:
                 stock_candle = self.candles.ensure_stock(sym)
                 stock_candle.oi = ob["oi"]
             await self._emit_tick("orderbook", f"STOCK_FUT:{sym}", ob)
+        elif rid in stock_eq_map:
+            sym = nifty50_canonical_symbol(_norm_symbol(stock_eq_map[rid]))
+            if ltp > 0:
+                self._update_stock_spot_candle(sym, ltp, _f(vol) if vol is not None else None)
+            await self._emit_tick("orderbook", f"STOCK:{sym}", ob)
         elif rid in opt_map or state_option is not None:
             strike, side = opt_map.get(rid) or state_option or (0, "")
             opt_key = opt_symbol_map.get(rid, f"NIFTY_{strike}_{side}")
@@ -782,6 +829,13 @@ class RealtimePipeline:
                 "open_interest": _pick(core, "open_interest", "openInterest", "oi"),
                 "ref_id": rid,
             }
+            self._update_option_candle(
+                int(strike),
+                opt_type,
+                ltp,
+                _f(vol) if vol is not None else None,
+                ob.get("oi"),
+            )
             print("OPTIONS COUNT:", len(self.state.options_by_strike))
             await self._refresh_option_chain(emit=True)
             await self._emit_tick("option", opt_key, leg[opt_type])
@@ -882,6 +936,18 @@ class RealtimePipeline:
                 }
             )
             leg[opt_type] = cur
+            ltp_raw = _pick(core, "ltp", "last_traded_price", "lastTradedPrice", "last_price")
+            ltp = self._to_rupees(ltp_raw, kind="OPT") if ltp_raw is not None else 0.0
+            vol_raw = _pick(core, "volume", "traded_volume", "tradedVolume", "total_volume")
+            oi_raw = _pick(core, "open_interest", "openInterest", "oi")
+            if ltp > 0:
+                self._update_option_candle(
+                    int(strike),
+                    opt_type,
+                    ltp,
+                    _f(vol_raw) if vol_raw is not None else None,
+                    _f(oi_raw) if oi_raw is not None else None,
+                )
             print("OPTIONS COUNT:", len(self.state.options_by_strike))
             await self._refresh_option_chain(emit=True)
             await self._emit_tick("option", opt_key, cur)
@@ -932,19 +998,6 @@ async def run_interval_scheduler(
         loop_wake_at = datetime.now(tz)
         delay = seconds_until_next_boundary(loop_wake_at, interval_minutes, tz)
         target_boundary = next_interval_boundary(loop_wake_at, interval_minutes, tz)
-        # #region agent log
-        _agent_debug_log(
-            "H-A",
-            "pipeline.py:scheduler:sleep",
-            "scheduler sleeping until next boundary",
-            {
-                "wake_at": loop_wake_at.isoformat(),
-                "delay_sec": round(delay, 3),
-                "target_boundary": target_boundary.isoformat(),
-                "last_emitted_start": last_emitted_start.isoformat() if last_emitted_start else None,
-            },
-        )
-        # #endregion
         if debug_state is not None:
             now_for_debug = datetime.now(tz)
             debug_state.update(
@@ -970,18 +1023,6 @@ async def run_interval_scheduler(
             if debug_state is not None:
                 debug_state.update({"status": "building", "last_error": None})
             now = datetime.now(tz)
-            # #region agent log
-            _agent_debug_log(
-                "H-A",
-                "pipeline.py:scheduler:boundary_reached",
-                "past target boundary before bucket selection",
-                {
-                    "now": now.isoformat(),
-                    "target_boundary": target_boundary.isoformat(),
-                    "late_ms": round((now - target_boundary).total_seconds() * 1000, 1),
-                },
-            )
-            # #endregion
             # Bar that just closed at `now` (e.g. now=12:06:00 → [12:03, 12:06)).
             bucket_start = closed_bucket_start(now, interval_minutes, tz)
             bucket_end = bucket_start + timedelta(minutes=interval_minutes)
@@ -990,39 +1031,10 @@ async def run_interval_scheduler(
                 gap_minutes = (bucket_start - last_emitted_start).total_seconds() / 60.0
                 if gap_minutes > interval_minutes:
                     missed = int(gap_minutes / interval_minutes) - 1
-                    # #region agent log
-                    _agent_debug_log(
-                        "H-A",
-                        "pipeline.py:scheduler:gap",
-                        "detected missing bucket gap before emit attempt",
-                        {
-                            "now": now.isoformat(),
-                            "bucket_start": bucket_start.isoformat(),
-                            "last_emitted_start": last_emitted_start.isoformat(),
-                            "gap_minutes": gap_minutes,
-                            "estimated_missed_buckets": missed,
-                            "sleep_late_sec": (now - loop_wake_at - timedelta(seconds=delay)).total_seconds(),
-                        },
-                    )
-                    # #endregion
             if bucket_id in emitted_bucket_ids or (
                 last_emitted_start is not None and bucket_start == last_emitted_start
             ):
                 log.warning("duplicate candle bucket skipped bucket_id=%s", bucket_id)
-                # #region agent log
-                _agent_debug_log(
-                    "H-B",
-                    "pipeline.py:scheduler:duplicate_skip",
-                    "duplicate candle bucket skipped",
-                    {
-                        "bucket_id": bucket_id,
-                        "bucket_start": bucket_start.isoformat(),
-                        "in_emitted_set": bucket_id in emitted_bucket_ids,
-                        "same_as_last": last_emitted_start == bucket_start if last_emitted_start else False,
-                        "now": now.isoformat(),
-                    },
-                )
-                # #endregion
                 if debug_state is not None:
                     debug_state.update(
                         {
@@ -1036,6 +1048,42 @@ async def run_interval_scheduler(
             if len(emitted_bucket_ids) > 128:
                 emitted_bucket_ids = set(list(emitted_bucket_ids)[-64:])
 
+            if not is_nse_cash_session_bar(bucket_start, bucket_end, tz):
+                log.info(
+                    "session candle skipped bucket_id=%s (outside 09:15-15:30 IST)",
+                    bucket_id,
+                )
+                if debug_state is not None:
+                    debug_state.update(
+                        {
+                            "status": "session_skipped",
+                            "last_bucket_id": bucket_id,
+                            "last_bucket_start": bucket_start.isoformat(),
+                            "last_bucket_end": bucket_end.isoformat(),
+                        }
+                    )
+                if nifty_ohlc_aggregator is not None:
+                    await nifty_ohlc_aggregator.snapshot_and_reset()
+                if order_book_aggregator is not None:
+                    await order_book_aggregator.snapshot_and_reset(
+                        atm_source=state.nifty_index.get("ltp") if isinstance(state.nifty_index, dict) else None,
+                        options_by_strike=state.options_by_strike,
+                    )
+                candle_board.reset_all()
+                new_bucket_start = bucket_end
+                new_bucket_end = new_bucket_start + timedelta(minutes=interval_minutes)
+                if is_nse_cash_session_bar(new_bucket_start, new_bucket_end, tz):
+                    await hub.broadcast_json(
+                        {
+                            "type": "candle_3m_open",
+                            "bucket_id": f"{new_bucket_start.isoformat()}:{interval_minutes}m",
+                            "bucket_start": new_bucket_start.isoformat(),
+                            "bucket_end": new_bucket_end.isoformat(),
+                            "interval_minutes": interval_minutes,
+                        }
+                    )
+                continue
+
             opt_sum = summarize_options_for_interval(state.option_chain_row, state.options_by_strike, prev_totals)
             try:
                 opt_sum = summarize_options_for_interval(state.option_chain_row, state.options_by_strike, prev_totals)
@@ -1047,6 +1095,8 @@ async def run_interval_scheduler(
 
             futures_candle_dicts = {k: v.to_dict() for k, v in candle_board.futures.items()}
             stock_candle_dicts = {k: v.to_dict() for k, v in candle_board.stock_futures.items()}
+            stock_spot_dicts = {k: v.to_dict() for k, v in candle_board.stock_spot.items()}
+            option_candle_dicts = {k: v.to_dict() for k, v in candle_board.options.items()}
 
             # Annotate stock futures with their underlying ticker so
             # downstream consumers can filter / join without parsing
@@ -1183,6 +1233,7 @@ async def run_interval_scheduler(
                 "nifty": nifty,
                 "futures": futures_candle_dicts,
                 "stocks": stock_candle_dicts,
+                "stock_spots": stock_spot_dicts,
                 "options": {
                     # ATM-centered chain reconstructed
                     # from options_by_strike on every NIFTY tick by
@@ -1191,6 +1242,7 @@ async def run_interval_scheduler(
                     "chain": list(state.option_chain_view),
                     "metrics": dict(state.option_metrics),
                     "summary": opt_sum,
+                    "candles": option_candle_dicts,
                 },
                 "stock_futures_summary": strength,
                 "analytics": analytics,
@@ -1256,8 +1308,7 @@ async def run_interval_scheduler(
                             meta = manager.get_fut_meta(sym)
                             if meta:
                                 fut_meta[sym] = meta
-                    # Candle prices are already in RUPEES (converted by pipeline._to_rupees).
-                    # Pass price_scale=1.0 so DBWriter stores them as-is without multiplying.
+                    # Prices are already in rupees (Grow-compatible). Do not scale OHLC.
                     price_scale = 1.0
                     log.info(
                         "QUEUE_ENQUEUE | topic=futures_3m bucket=%s futures=%d stocks=%d "
@@ -1289,6 +1340,9 @@ async def run_interval_scheduler(
             if db_writer is not None:
                 try:
                     option_chain_view = list(state.option_chain_view)
+                    option_candle_dicts = {
+                        k: v.to_dict() for k, v in candle_board.options.items()
+                    }
                     spot_for_opts = index_candle.get("close") or state.option_metrics.get("atm_strike")
                     option_expiry = None
                     try:
@@ -1301,8 +1355,12 @@ async def run_interval_scheduler(
                     except Exception:
                         option_expiry = None
                     log.info(
-                        "OPTION_DB_ENQUEUE | bucket=%s chain_rows=%d expiry=%s spot=%s",
-                        bucket_id, len(option_chain_view), option_expiry, spot_for_opts,
+                        "OPTION_DB_ENQUEUE | bucket=%s chain_rows=%d option_candles=%d expiry=%s spot=%s",
+                        bucket_id,
+                        len(option_chain_view),
+                        len(option_candle_dicts),
+                        option_expiry,
+                        spot_for_opts,
                     )
                     await db_writer.enqueue(
                         "options_3m",
@@ -1313,27 +1371,42 @@ async def run_interval_scheduler(
                             "underlying": "NIFTY",
                             "spot": spot_for_opts,
                             "chain": option_chain_view,
+                            "option_candles": option_candle_dicts,
                         },
                     )
                 except Exception as exc:
                     log.exception("failed enqueueing options_3m bucket_id=%s: %s", bucket_id, exc)
+            if db_writer is not None:
+                try:
+                    stock_spot_dicts = {k: v.to_dict() for k, v in candle_board.stock_spot.items()}
+                    stock_eq_meta: dict[str, dict[str, Any]] = {}
+                    try:
+                        from app.main import APP_STATE  # late import: avoid cycle
+
+                        ingestion = APP_STATE.get("ingestion") if isinstance(APP_STATE, dict) else None
+                        manager = getattr(ingestion, "instrument_manager", None)
+                        if manager is not None:
+                            for sym in stock_spot_dicts:
+                                meta = manager.get_stock_eq_meta(sym)
+                                if meta:
+                                    stock_eq_meta[sym] = meta
+                    except Exception:
+                        pass
+                    await db_writer.enqueue(
+                        "market_ohlc_bundle",
+                        {
+                            "bucket_end": bucket_end.isoformat(),
+                            "nifty": nifty,
+                            "stock_spots": stock_spot_dicts,
+                            "stock_eq_meta": stock_eq_meta,
+                        },
+                    )
+                except Exception as exc:
+                    log.exception("failed enqueueing market_ohlc_bundle bucket_id=%s: %s", bucket_id, exc)
             try:
                 await hub.broadcast_json(msg)
             except Exception as exc:
                 log.exception("candle emit failed: %s", exc)
-                # #region agent log
-                _agent_debug_log(
-                    "H-D",
-                    "pipeline.py:scheduler:broadcast_fail",
-                    "broadcast failed; bucket marked emitted but reset skipped",
-                    {
-                        "bucket_id": bucket_id,
-                        "bucket_start": bucket_start.isoformat(),
-                        "error": repr(exc),
-                        "processing_sec": round(time.monotonic() - iter_start_mono, 3),
-                    },
-                )
-                # #endregion
                 if debug_state is not None:
                     debug_state.update(
                         {
@@ -1358,21 +1431,6 @@ async def run_interval_scheduler(
                         "last_stocks_count": len(stock_candle_dicts),
                     }
                 )
-            # #region agent log
-            _agent_debug_log(
-                "H-A",
-                "pipeline.py:scheduler:emitted",
-                "candle emitted successfully",
-                {
-                    "bucket_id": bucket_id,
-                    "bucket_start": bucket_start.isoformat(),
-                    "bucket_end": bucket_end.isoformat(),
-                    "now": now.isoformat(),
-                    "processing_sec": round(time.monotonic() - iter_start_mono, 3),
-                    "index_tick_count": index_candle.get("tick_count"),
-                },
-            )
-            # #endregion
             candle_board.reset_all()
 
             # Immediately announce the new bar that has just opened so
@@ -1382,15 +1440,16 @@ async def run_interval_scheduler(
             # the bucket and the closed snapshot will arrive at bucket_end.
             new_bucket_start = bucket_end
             new_bucket_end = new_bucket_start + timedelta(minutes=interval_minutes)
-            await hub.broadcast_json(
-                {
-                    "type": "candle_3m_open",
-                    "bucket_id": f"{new_bucket_start.isoformat()}:{interval_minutes}m",
-                    "bucket_start": new_bucket_start.isoformat(),
-                    "bucket_end": new_bucket_end.isoformat(),
-                    "interval_minutes": interval_minutes,
-                }
-            )
+            if is_nse_cash_session_bar(new_bucket_start, new_bucket_end, tz):
+                await hub.broadcast_json(
+                    {
+                        "type": "candle_3m_open",
+                        "bucket_id": f"{new_bucket_start.isoformat()}:{interval_minutes}m",
+                        "bucket_start": new_bucket_start.isoformat(),
+                        "bucket_end": new_bucket_end.isoformat(),
+                        "interval_minutes": interval_minutes,
+                    }
+                )
         except asyncio.CancelledError:
             if debug_state is not None:
                 debug_state.update({"status": "cancelled"})
@@ -1404,16 +1463,4 @@ async def run_interval_scheduler(
                         "last_error_at": datetime.now(tz).isoformat(),
                     }
                 )
-            # #region agent log
-            _agent_debug_log(
-                "H-C",
-                "pipeline.py:scheduler:iteration_error",
-                "scheduler iteration failed before/during emit",
-                {
-                    "error": repr(exc),
-                    "processing_sec": round(time.monotonic() - iter_start_mono, 3),
-                    "last_emitted_start": last_emitted_start.isoformat() if last_emitted_start else None,
-                },
-            )
-            # #endregion
             log.exception("candle interval scheduler iteration failed (will retry next boundary)")

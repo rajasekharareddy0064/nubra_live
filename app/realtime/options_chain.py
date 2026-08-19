@@ -1,7 +1,7 @@
 """
 Real-time NIFTY option-chain processor.
 
-Reconstructs an 11-strike option chain (5 ITM + 1 ATM + 5 OTM) from the
+Reconstructs a 21-strike option chain (10 ITM + 1 ATM + 10 OTM) from the
 ``options_by_strike`` dict that :class:`app.realtime.market_state.MarketStateStore`
 keeps populated by per-ref orderbook + greeks ticks. Computes the
 ML-friendly metrics used downstream (PCR, OI skew, max-OI strikes,
@@ -12,7 +12,7 @@ when the ATM strike rolls.
 Public surface (matches the spec in the project brief):
 
 * :func:`get_atm_strike` — round spot to the nearest 50.
-* :func:`get_strike_range` — 11 strikes around ATM.
+* :func:`get_strike_range` — 21 strikes around ATM (±10).
 * :func:`build_option_chain` — reconstruct an ordered chain from
   ``options_by_strike``.
 * :func:`compute_option_metrics` — aggregate ML metrics over a chain.
@@ -33,10 +33,11 @@ Design notes
 * ``step`` is hard-coded to 50 (NIFTY's listed strike spacing). If
   Nubra ever switches the contract spec, change ``STRIKE_STEP`` here
   and in :class:`app.instruments.manager.InstrumentManager`.
-* Strike radius for the **chain view** (5) is intentionally narrower
+* Strike radius for the **chain view** (10) is intentionally narrower
   than the manager's **subscription radius** (default 15 → 31 strikes)
   — we subscribe to a wider window so we have data covering ATM
-  drift, but only present the ATM +/- 5 slice to consumers.
+  drift, but only present the ATM ±10 slice to consumers (matches
+  order_book_3m_strikes).
 """
 
 from __future__ import annotations
@@ -56,8 +57,11 @@ logger = logging.getLogger(__name__)
 STRIKE_STEP: int = 50
 
 #: How many strikes either side of ATM the chain view exposes.
-#: 5 -> 5 ITM + 1 ATM + 5 OTM = 11 strikes.
-STRIKE_RADIUS: int = 5
+#: 10 -> 10 ITM + 1 ATM + 10 OTM = 21 strikes (matches order book emit).
+STRIKE_RADIUS: int = 10
+
+#: Minimum strike rows expected when spot is valid (2 * STRIKE_RADIUS + 1).
+MIN_CHAIN_STRIKES: int = 2 * STRIKE_RADIUS + 1
 
 #: Minimum interval between chain rebuilds when the ATM hasn't moved.
 #: Sub-second so the WebSocket / REST consumers see fresh OI as it
@@ -69,9 +73,11 @@ THROTTLE_MS: int = 500
 __all__ = [
     "STRIKE_STEP",
     "STRIKE_RADIUS",
+    "MIN_CHAIN_STRIKES",
     "THROTTLE_MS",
     "get_atm_strike",
     "get_strike_range",
+    "filter_chain_to_radius",
     "build_option_chain",
     "compute_option_metrics",
     "update_candle_options",
@@ -146,6 +152,31 @@ def get_strike_range(
 ) -> list[int]:
     """Return ``2*radius + 1`` strikes centred on ``atm``, ascending."""
     return [int(atm + i * step) for i in range(-radius, radius + 1)]
+
+
+def filter_chain_to_radius(
+    chain: list[dict[str, Any]],
+    spot: float | int | None,
+    *,
+    step: int = STRIKE_STEP,
+    radius: int = STRIKE_RADIUS,
+) -> list[dict[str, Any]]:
+    """Keep only strikes within ATM ±radius (used before DB insert / backfill)."""
+    atm = get_atm_strike(spot, step=step)
+    if atm is None:
+        return list(chain)
+    allowed = set(get_strike_range(atm, step=step, radius=radius))
+    out: list[dict[str, Any]] = []
+    for row in chain:
+        if not isinstance(row, dict):
+            continue
+        try:
+            strike = int(round(float(row.get("strike"))))
+        except (TypeError, ValueError):
+            continue
+        if strike in allowed:
+            out.append(row)
+    return out
 
 
 def build_option_chain(
@@ -392,7 +423,7 @@ class OptionsChainBuilder:
         metrics = compute_option_metrics(chain)
 
         if atm_changed:
-            logger.info(
+            logger.debug(
                 "Option chain rebuilt | atm_rolled %s -> %s | rows=%d",
                 self._last_atm,
                 atm_resolved,

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
+
+# NSE cash / F&O regular session. 3m bars are emitted at bucket close, so the
+# first written bar is [09:15, 09:18) and the last is [15:27, 15:30).
+NSE_SESSION_OPEN = time(9, 15)
+NSE_SESSION_CLOSE = time(15, 30)
 
 
 def market_tz(name: str) -> ZoneInfo:
@@ -39,3 +44,33 @@ def next_interval_boundary(now: datetime, interval_minutes: int, tz: ZoneInfo) -
     """Wall-clock time when the current interval bucket closes."""
     current_start = floor_to_interval(now, interval_minutes, tz)
     return current_start + timedelta(minutes=interval_minutes)
+
+
+def is_nse_cash_session_bar(bucket_start: datetime, bucket_end: datetime, tz: ZoneInfo) -> bool:
+    """True if the closed bar lies fully inside 09:15–15:30 IST.
+
+    Skips the 09:12 close ([09:12, 09:15)) and anything after 15:30.
+    """
+    start = bucket_start.astimezone(tz) if bucket_start.tzinfo else bucket_start.replace(tzinfo=tz)
+    end = bucket_end.astimezone(tz) if bucket_end.tzinfo else bucket_end.replace(tzinfo=tz)
+    open_dt = start.replace(
+        hour=NSE_SESSION_OPEN.hour,
+        minute=NSE_SESSION_OPEN.minute,
+        second=0,
+        microsecond=0,
+    )
+    close_dt = start.replace(
+        hour=NSE_SESSION_CLOSE.hour,
+        minute=NSE_SESSION_CLOSE.minute,
+        second=0,
+        microsecond=0,
+    )
+    return start >= open_dt and end <= close_dt
+
+
+def is_nse_session_close_label(dt: datetime, *, interval_minutes: int = 3) -> bool:
+    """True if a bar-close clock time is a regular-session close (09:18..15:30)."""
+    minutes = int(dt.hour) * 60 + int(dt.minute)
+    first_close = NSE_SESSION_OPEN.hour * 60 + NSE_SESSION_OPEN.minute + int(interval_minutes)
+    last_close = NSE_SESSION_CLOSE.hour * 60 + NSE_SESSION_CLOSE.minute
+    return first_close <= minutes <= last_close

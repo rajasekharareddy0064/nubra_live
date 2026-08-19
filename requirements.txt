@@ -8,6 +8,7 @@ numpy
 pandas
 python-dotenv
 pyotp
+protobuf==6.31.1
 google-cloud-secret-manager
 google-cloud-run
 google-cloud-storage

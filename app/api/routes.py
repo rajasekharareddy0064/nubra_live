@@ -132,15 +132,46 @@ async def get_current_candles() -> dict:
         "seconds_into_bucket": (now - bucket_start).total_seconds(),
         "futures": futures,
         "stocks": stocks,
+        "stock_spots": {k: v.to_dict() for k, v in candle_board.stock_spot.items()},  # type: ignore[union-attr]
         "options": {
             "chain": chain,
             "metrics": metrics,
+            "candles": {k: v.to_dict() for k, v in candle_board.options.items()},  # type: ignore[union-attr]
         },
         "meta": {
             "index": candle_board.nifty.to_dict(),  # type: ignore[union-attr]
             "nifty_fut_contracts": nifty_fut_contracts,
         },
     }
+
+
+@router.get("/realtime/candles/last")
+async def get_last_closed_candle() -> dict:
+    """Most recently closed ``candle_3m`` snapshot from LiveHub."""
+    from app.main import APP_STATE
+
+    hub = APP_STATE.get("hub")
+    candle = getattr(hub, "last_candle_3m", None) if hub is not None else None
+    if not candle:
+        raise HTTPException(status_code=404, detail="no closed 3m candle has been emitted yet")
+    return candle
+
+
+@router.get("/realtime/historical-compare/last")
+async def get_last_historical_compare() -> dict:
+    """Last historical_data() vs live 3m mismatch report."""
+    from app.main import APP_STATE
+
+    poller = APP_STATE.get("historical_compare")
+    if poller is None:
+        raise HTTPException(
+            status_code=404,
+            detail="historical compare poller is not running; set ENABLE_HISTORICAL_COMPARE=true",
+        )
+    report = getattr(poller, "last_report", None)
+    if not report:
+        raise HTTPException(status_code=404, detail="no historical compare report yet")
+    return report
 
 
 @router.get("/debug/subscriptions")

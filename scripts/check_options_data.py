@@ -36,9 +36,9 @@ async def check_options_data():
         rows = await conn.fetch(f"""
             SELECT timestamp AT TIME ZONE 'Asia/Kolkata' as ts,
                    symbol,
-                   ROUND(strike::numeric/100.0, 2) as strike_rs,
+                   ROUND(strike::numeric, 2) as strike_rs,
                    option_type,
-                   ROUND(ltp::numeric/100.0, 2) as ltp_rs,
+                   ROUND(ltp::numeric, 2) as ltp_rs,
                    volume,
                    oi,
                    ROUND(iv::numeric, 2) as iv,
@@ -80,7 +80,12 @@ async def check_options_data():
         print(f"{'-'*50}")
         for r in distribution:
             time_str = str(r['minute'])[-16:-3] if r['minute'] else '?'
-            print(f"{time_str:<20} {r['rows_per_minute']:>10} {r['unique_strikes']:>10} {r['unique_types']:>10}")
+            strike_note = " (expect ~21)" if r['unique_strikes'] and r['unique_strikes'] < 15 else ""
+            print(
+                f"{time_str:<20} {r['rows_per_minute']:>10} "
+                f"{r['unique_strikes']:>10}{strike_note} {r['unique_types']:>10}"
+            )
+        print("\n  Expected per 3m bar: ~21 strikes, ~42 rows (ATM±10, CE+PE)")
     
     else:
         print(f"\n[!] NO DATA FOUND in options_data table for today ({today})")

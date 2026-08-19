@@ -418,6 +418,19 @@ async def lifespan(_: FastAPI):
         logger=logger,
     )
 
+    if live_mode and settings.enable_historical_compare:
+        from app.historical.poller import HistoricalComparePoller
+
+        hist_poller = HistoricalComparePoller(hub)
+        APP_STATE["historical_compare"] = hist_poller
+        _track_task(
+            tasks,
+            hist_poller.run_forever(),
+            name="HistoricalComparePoller",
+            logger=logger,
+        )
+        logger.info("historical compare poller scheduled")
+
     if database_task_kwargs is not None:
         _track_task(
             tasks,

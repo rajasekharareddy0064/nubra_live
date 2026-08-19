@@ -32,6 +32,17 @@ def _to_month_key(value: object) -> str:
     return parsed.strftime("%Y-%m")
 
 
+def _is_internal_option_key(symbol: str) -> bool:
+    """True for pipeline keys like ``NIFTY_24600_CE``, not exchange trading symbols."""
+    parts = str(symbol or "").strip().upper().split("_")
+    return (
+        len(parts) == 3
+        and parts[0] == "NIFTY"
+        and parts[1].isdigit()
+        and parts[2] in {"CE", "PE"}
+    )
+
+
 def _to_expiry_dt(value: object) -> pd.Timestamp:
     if value is None:
         return pd.NaT
@@ -101,12 +112,16 @@ class InstrumentManager:
         self._strike_step: int = 50
         self._strike_scale: int = 1
         self._option_symbol_by_ref: dict[int, str] = {}
+        self._option_trading_symbol_by_ref: dict[int, str] = {}
         self._nifty_fut_refs: list[int] = []
         self._nifty_fut_contract_by_ref: dict[int, str] = {}
         self._nifty_fut_symbol_by_ref: dict[int, str] = {}
         self._fut_by_symbol: dict[str, dict[str, Any]] = {}
         self._stock_fut_refs: list[int] = []
         self._stock_fut_assets: set[str] = set()
+        self._stock_eq_refs: list[int] = []
+        self._stock_eq_assets: set[str] = set()
+        self._stock_eq_by_symbol: dict[str, dict[str, Any]] = {}
 
         self.df: pd.DataFrame = self._load_instruments()
         self._prepare_indices()
@@ -145,6 +160,59 @@ class InstrumentManager:
     def get_stock_futures(self) -> list[int]:
         return list(self._stock_fut_refs)
 
+    def get_stock_equity(self) -> list[int]:
+        return list(self._stock_eq_refs)
+
+    def get_stock_eq_meta(self, symbol: str) -> dict[str, Any] | None:
+        """NIFTY50 cash symbol → token / exchange metadata for market_ohlc_3m."""
+        return self._stock_eq_by_symbol.get(nifty50_canonical_symbol(str(symbol).strip().upper()))
+
+    def get_stock_spot_symbols(self) -> list[str]:
+        """Canonical NIFTY50 cash symbols resolved from the instrument master."""
+        return sorted(self._stock_eq_by_symbol)
+
+    def get_stock_fut_trading_symbols(self) -> list[str]:
+        """Nearest NIFTY50 stock-future trading symbols (e.g. ``RELIANCE26MAYFUT``)."""
+        out: list[str] = []
+        seen: set[str] = set()
+        for ref in self._stock_fut_refs:
+            rows = self.df[self.df["ref_id"] == ref]
+            if rows.empty:
+                continue
+            sym = str(rows.iloc[0].get("symbol") or "").strip().upper()
+            if sym and sym not in seen:
+                seen.add(sym)
+                out.append(sym)
+        return out
+
+    def get_option_trading_symbol_by_ref(self) -> dict[int, str]:
+        """``ref_id`` → master trading symbol for historical_data() (not ``NIFTY_24600_CE``)."""
+        return dict(self._option_trading_symbol_by_ref)
+
+    def get_atm_option_legs(self, nifty_price: float | None = None) -> list[dict[str, Any]]:
+        """ATM ± strike_radius option legs with historical-API trading symbols."""
+        try:
+            px = float(nifty_price) if nifty_price and float(nifty_price) > 0 else 0.0
+        except (TypeError, ValueError):
+            px = 0.0
+        if px <= 0:
+            px = float(self._active_atm or 0) or 22000.0
+        maps = self.get_ref_maps(px)
+        legs: list[dict[str, Any]] = []
+        for ref_id, (strike, side) in (maps.get("option_by_ref") or {}).items():
+            trading = self._option_trading_symbol_by_ref.get(int(ref_id), "")
+            if not trading:
+                continue
+            legs.append(
+                {
+                    "ref_id": int(ref_id),
+                    "symbol": trading,
+                    "strike": int(strike),
+                    "side": str(side).upper(),
+                }
+            )
+        return legs
+
     @property
     def price_scale(self) -> int:
         """Multiplier between Nubra wire prices and rupees.
@@ -166,7 +234,7 @@ class InstrumentManager:
 
     def to_rupees(self, price: Any) -> float:
         from app.core.price_utils import normalize_price
-        return normalize_price(price, scale=float(self.price_scale), module="manager")
+        return normalize_price(price, scale=float(self.price_scale), kind="INDEX", module="manager")
 
     def get_option_tokens(self, atm: int) -> list[int]:
         center_rupee = self._nearest_50(atm)
@@ -183,9 +251,6 @@ class InstrumentManager:
                 tokens.append(ce)
             if pe is not None:
                 tokens.append(pe)
-        print("ATM:", center_rupee)
-        print("STRIKES:", strikes)
-        print("TOKENS:", len(tokens))
         return tokens
 
     def get_option_subscription_payload(self, nifty_price: float | None = None) -> dict[str, Any]:
@@ -313,6 +378,7 @@ class InstrumentManager:
             "index": [self.get_nifty_index()],
             "nifty_futures": nifty_futures,
             "stock_futures": self.get_stock_futures(),
+            "stock_equity": self.get_stock_equity(),
             "options": options,
         }
 
@@ -329,7 +395,12 @@ class InstrumentManager:
         token_bundle = self.get_subscription_tokens(nifty_price=nifty_price)
 
         option_ref_ids = token_bundle["options"]
-        orderbook_ref_ids = token_bundle["nifty_futures"] + token_bundle["stock_futures"] + option_ref_ids
+        orderbook_ref_ids = (
+            token_bundle["nifty_futures"]
+            + token_bundle["stock_futures"]
+            + token_bundle.get("stock_equity", [])
+            + option_ref_ids
+        )
 
         # Keep output deterministic and compact.
         orderbook_ref_ids = sorted(set(orderbook_ref_ids))
@@ -395,6 +466,13 @@ class InstrumentManager:
             sym = rows.iloc[0].get("symbol") or rows.iloc[0].get("asset") or ""
             stock_fut_symbols[int(ref)] = str(sym).strip().upper()
 
+        stock_eq_symbols: dict[int, str] = {}
+        for ref in self._stock_eq_refs:
+            for sym, meta in self._stock_eq_by_symbol.items():
+                if meta.get("ref_id") == ref:
+                    stock_eq_symbols[int(ref)] = sym
+                    break
+
         return {
             "atm": atm,
             "nifty_fut_ref": self._nifty_fut_ref,
@@ -402,6 +480,7 @@ class InstrumentManager:
             "nifty_fut_contract_by_ref": dict(self._nifty_fut_contract_by_ref),
             "nifty_fut_symbol_by_ref": dict(self._nifty_fut_symbol_by_ref),
             "stock_fut_symbols": stock_fut_symbols,
+            "stock_eq_symbols": stock_eq_symbols,
             "option_by_ref": option_by_ref,
             "option_symbol_by_ref": {
                 ref_id: self._option_symbol_by_ref.get(ref_id, f"NIFTY_{strike}_{side}")
@@ -726,7 +805,45 @@ class InstrumentManager:
                 missing,
             )
 
-        # Resolve symbols for index stream (index + futures).
+        # NIFTY50 cash equities (spot) — one row per asset, derivative_type STOCK.
+        stock_eq = df[
+            (df["derivative_type"] == "STOCK")
+            & (df["asset_type"] == "STOCKS")
+        ].copy()
+        if self.nifty50_symbols:
+            eq_assets = nifty50_master_assets(self.nifty50_symbols)
+            stock_eq = stock_eq[stock_eq["asset"].isin(eq_assets)]
+        stock_eq = stock_eq.drop_duplicates(subset=["asset"], keep="first")
+        self._stock_eq_refs = [int(ref) for ref in stock_eq["ref_id"].tolist()]
+        self._stock_eq_assets = {
+            nifty50_canonical_symbol(str(asset))
+            for asset in stock_eq["asset"].tolist()
+            if str(asset).strip()
+        }
+        self._stock_eq_assets = {a for a in self._stock_eq_assets if a in self.nifty50_symbols}
+        self._stock_eq_by_symbol = {}
+        for _, row in stock_eq.iterrows():
+            asset = nifty50_canonical_symbol(str(row.get("asset") or "").strip().upper())
+            if not asset:
+                continue
+            token = row.get("token")
+            self._stock_eq_by_symbol[asset] = {
+                "symbol": asset,
+                "symbol_token": str(int(token)) if pd.notna(token) else None,
+                "exchange": str(row.get("exchange") or "NSE").strip().upper(),
+                "instrument_type": "STOCK",
+                "ref_id": int(row["ref_id"]),
+            }
+        if len(self._stock_eq_refs) != expected_count:
+            missing_eq = sorted(self.nifty50_symbols - self._stock_eq_assets)
+            self.logger.warning(
+                "NIFTY50 stock equity incomplete | resolved=%d expected=%d missing=%s",
+                len(self._stock_eq_refs),
+                expected_count,
+                missing_eq,
+            )
+
+        # Resolve symbols for index stream (index + futures + spot equities).
         ref_to_symbol = (
             df[["ref_id", "symbol"]]
             .dropna(subset=["symbol"])
@@ -743,6 +860,8 @@ class InstrumentManager:
             symbol = ref_to_symbol.get(ref_id)
             if symbol:
                 index_symbols.append(symbol)
+        for asset in sorted(self._stock_eq_assets):
+            index_symbols.append(asset)
         self._index_symbols = sorted(set(index_symbols))
 
         # Option map: strike -> {CE: ref_id, PE: ref_id} for nearest non-expired NIFTY expiry.
@@ -779,31 +898,50 @@ class InstrumentManager:
                 # If cache is stale, use latest available expiry instead of oldest expired.
                 selected_expiry_dt = pd.Timestamp(valid_exp["_effective_expiry_dt"].max()).normalize()
 
+        opt_keep = [c for c in ("strike_price", "option_type", "ref_id", "symbol") if c in df.columns]
         option_df = df[
             (df["asset"] == "NIFTY")
             & (df["derivative_type"] == "OPT")
             & (df["expiry_dt"] == selected_expiry_dt)
             & (df["option_type"].isin(["CE", "PE"]))
             & (df["strike_price"].notna())
-        ][["strike_price", "option_type", "ref_id"]].copy()
+        ][opt_keep].copy()
 
         # Fallback using effective expiry when normalized expiry_dt is missing/misaligned.
         if option_df.empty and selected_expiry_dt is not None and not nifty_opt_all.empty:
+            fallback_keep = [c for c in opt_keep if c in nifty_opt_all.columns]
             option_df = nifty_opt_all[
                 nifty_opt_all["_effective_expiry_dt"] == selected_expiry_dt
-            ][["strike_price", "option_type", "ref_id"]].copy()
+            ][fallback_keep].copy()
 
         option_df["strike_price"] = option_df["strike_price"].astype(int)
         grouped: dict[int, dict[str, int]] = {}
         option_symbol_by_ref: dict[int, str] = {}
+        option_trading_symbol_by_ref: dict[int, str] = {}
         for row in option_df.itertuples(index=False):
             strike = int(row.strike_price)
-            side = str(row.option_type)
+            side = str(row.option_type).upper()
             ref_id = int(row.ref_id)
             grouped.setdefault(strike, {})[side] = ref_id
-            option_symbol_by_ref[ref_id] = f"NIFTY_{int(round(strike / max(self._strike_scale, 1)))}_{side}"
+            strike_rupees = int(round(strike / max(self._strike_scale, 1)))
+            option_symbol_by_ref[ref_id] = f"NIFTY_{strike_rupees}_{side}"
+            master_sym = ""
+            if hasattr(row, "symbol") and row.symbol is not None:
+                master_sym = str(row.symbol).strip().upper()
+                if master_sym in {"", "NAN", "NONE", "NAT"}:
+                    master_sym = ""
+            if not master_sym or _is_internal_option_key(master_sym):
+                if selected_expiry_dt is not None and pd.notna(selected_expiry_dt):
+                    exp = pd.Timestamp(selected_expiry_dt)
+                    master_sym = (
+                        f"NIFTY{int(exp.year) % 100}{int(exp.month)}{int(exp.day)}"
+                        f"{strike_rupees}{side}"
+                    )
+            if master_sym:
+                option_trading_symbol_by_ref[ref_id] = master_sym
         self._option_map = grouped
         self._option_symbol_by_ref = option_symbol_by_ref
+        self._option_trading_symbol_by_ref = option_trading_symbol_by_ref
         self._available_strikes = sorted(grouped.keys())
         if len(self._available_strikes) >= 2:
             diffs = [

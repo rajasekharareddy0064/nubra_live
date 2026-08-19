@@ -64,12 +64,18 @@ class OHLCV:
 
 @dataclass
 class CandleBoard:
-    """In-memory OHLCV for index, NIFTY fut, and per-symbol stock futures."""
+    """In-memory OHLCV for index, NIFTY fut, stock futures, stock spot, and options."""
 
     nifty: OHLCV = field(default_factory=OHLCV)
     nifty_futures: OHLCV = field(default_factory=OHLCV)
     futures: dict[str, OHLCV] = field(default_factory=dict)
     stock_futures: dict[str, OHLCV] = field(default_factory=dict)
+    stock_spot: dict[str, OHLCV] = field(default_factory=dict)
+    options: dict[str, OHLCV] = field(default_factory=dict)
+
+    @staticmethod
+    def option_key(strike: int, side: str) -> str:
+        return f"{int(strike)}:{str(side).upper()}"
 
     def reset_all(self) -> None:
         self.nifty.reset()
@@ -78,6 +84,12 @@ class CandleBoard:
             c.reset()
         for c in self.stock_futures.values():
             c.reset()
+        for c in self.stock_spot.values():
+            c.reset()
+        self.stock_spot.clear()
+        for c in self.options.values():
+            c.reset()
+        self.options.clear()
 
     def ensure_futures(self, symbol: str) -> OHLCV:
         if symbol not in self.futures:
@@ -88,3 +100,15 @@ class CandleBoard:
         if symbol not in self.stock_futures:
             self.stock_futures[symbol] = OHLCV()
         return self.stock_futures[symbol]
+
+    def ensure_stock_spot(self, symbol: str) -> OHLCV:
+        sym = str(symbol).strip().upper()
+        if sym not in self.stock_spot:
+            self.stock_spot[sym] = OHLCV()
+        return self.stock_spot[sym]
+
+    def ensure_option(self, strike: int, side: str) -> OHLCV:
+        key = self.option_key(strike, side)
+        if key not in self.options:
+            self.options[key] = OHLCV()
+        return self.options[key]

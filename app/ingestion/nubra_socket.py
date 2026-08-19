@@ -198,8 +198,7 @@ class NubraIngestionService:
 
         total_symbols = sum(len(values) for values in subs.values())
         self.logger.info("SUBSCRIBED_%d_SYMBOLS", total_symbols)
-        self.logger.info("SUBSCRIBED")
-        self.logger.info("Active subscription payloads: %s", subs)
+        self.logger.debug("Active subscription payloads: %s", subs)
 
     def _on_option_tokens_changed(self, diff: Any) -> None:
         """Called from InstrumentManager (possibly a background thread)."""

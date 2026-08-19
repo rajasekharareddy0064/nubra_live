@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     use_database: bool = False
     use_redis: bool = False
     strike_radius: int = 15
+    #: ATM ±N strikes for options_data / chain view / backfill (order book uses same).
+    option_emit_radius: int = 10
     candle_interval_minutes: int = 3
     market_timezone: str = "Asia/Kolkata"
     subscribe_sdk_ohlcv: bool = False
@@ -32,6 +34,15 @@ class Settings(BaseSettings):
     #: ``NIFTY:YYYYMMDD`` (see Nubra option-chain docs). Heavier than
     #: ref-id orderbook alone; set false if you hit subscription limits.
     subscribe_sdk_option_chain: bool = True
+
+    #: Poll Nubra historical_data() after each closed 3m bar and diff vs live.
+    #: Default off so we do not burn the 60 req/min historical quota until enabled.
+    enable_historical_compare: bool = False
+    historical_compare_settle_seconds: int = 12
+    historical_price_abs_tol: float = 0.05
+    #: Tick OHLC vs official REST for NIFTY is typically a few points, not paise.
+    historical_index_price_abs_tol: float = 10.0
+    historical_volume_rel_tol: float = 0.02
 
     queue_maxsize: int = 100000
     db_batch_size: int = 500

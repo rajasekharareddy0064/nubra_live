@@ -46,6 +46,11 @@ class LiveHub:
     def client_count(self) -> int:
         return len(self._clients)
 
+    @property
+    def last_candle_3m(self) -> dict[str, Any] | None:
+        """Most recently closed ``candle_3m`` snapshot, or ``None``."""
+        return self._last_candle_3m
+
     async def register(self, websocket: WebSocket) -> None:
         self._clients.add(websocket)
         self._client_locks[websocket] = asyncio.Lock()
@@ -153,8 +158,15 @@ class LiveHub:
                 mtype,
                 message.get("bucket_start"),
             )
-        else:
+        elif mtype in ("candle_3m", "candle_3m_open"):
             self.logger.info(
+                "hub broadcast type=%s clients=%d bucket=%s",
+                mtype_key,
+                self.client_count,
+                message.get("bucket_start"),
+            )
+        else:
+            self.logger.debug(
                 "hub broadcast type=%s clients=%d bucket=%s",
                 mtype_key,
                 self.client_count,

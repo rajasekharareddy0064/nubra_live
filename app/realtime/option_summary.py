@@ -48,22 +48,18 @@ def summarize_options_for_interval(
     if isinstance(pe, dict):
         pe = [v for v in pe.values() if isinstance(v, dict)]
     if not isinstance(ce, list):
-        print("DEBUG option_summary bad ce type:", type(ce), ce)
         ce = []
     if not isinstance(pe, list):
-        print("DEBUG option_summary bad pe type:", type(pe), pe)
         pe = []
     if ce or pe:
         for row in ce:
             if not isinstance(row, dict):
-                print("DEBUG option_summary bad ce row type:", type(row), row)
                 continue
             r = row or {}
             ce_oi += _f(r.get("open_interest") or r.get("oi"))
             ce_vol += _f(r.get("volume"))
         for row in pe:
             if not isinstance(row, dict):
-                print("DEBUG option_summary bad pe row type:", type(row), row)
                 continue
             r = row or {}
             pe_oi += _f(r.get("open_interest") or r.get("oi"))
@@ -71,7 +67,6 @@ def summarize_options_for_interval(
     else:
         for _strike, legs in options_by_strike.items():
             if not isinstance(legs, dict):
-                print("DEBUG option_summary bad legs type:", type(legs), legs)
                 continue
             ce_d = legs.get("CE") or {}
             pe_d = legs.get("PE") or {}

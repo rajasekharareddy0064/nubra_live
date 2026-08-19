@@ -23,8 +23,8 @@ async def run():
     print("\n[1] NIFTY FUTURES (futures_data)")
     rows = await conn.fetch(f"""
         SELECT timestamp AT TIME ZONE 'Asia/Kolkata' as ts, symbol,
-               ROUND(open::numeric/100,2) as o, ROUND(high::numeric/100,2) as h,
-               ROUND(low::numeric/100,2) as l, ROUND(close::numeric/100,2) as c,
+               ROUND(open::numeric,2) as o, ROUND(high::numeric,2) as h,
+               ROUND(low::numeric,2) as l, ROUND(close::numeric,2) as c,
                ROUND(volume::numeric,0) as v, ROUND(oi::numeric,0) as oi
         FROM "{s}".futures_data
         WHERE DATE(timestamp AT TIME ZONE 'Asia/Kolkata')='{today}'

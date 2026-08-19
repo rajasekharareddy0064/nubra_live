@@ -329,6 +329,24 @@ def bootstrap_session_from_env(base_dir: str | Path | None = None) -> bool:
             "SESSION_EXPIRED | NUBRA_SESSION_TOKEN expired — seeding "
             "x-device-id only to preserve enrolled device binding for TOTP login"
         )
+        # Do not clobber a still-valid shelve written by setup_totp.py.
+        try:
+            import shelve as _shelve
+
+            db_path = str(base / _AUTH_DB_PREFIX)
+            if any((base / f"{_AUTH_DB_PREFIX}.{ext}").exists() for ext in _AUTH_DB_EXTS):
+                with _shelve.open(db_path, flag="r") as db:
+                    cached = db.get("session_token")
+                    cached_device = db.get("x-device-id")
+                if cached and not _is_jwt_expired(cached):
+                    logger.info(
+                        "Keeping valid auth_data.db session (env NUBRA_SESSION_TOKEN is stale)"
+                    )
+                    return False
+                if cached_device:
+                    return False
+        except Exception:  # noqa: BLE001
+            pass
         # Still seed device-id so TOTP login reuses the enrolled device.
         # Without this, SDK generates a fresh UUID → server says "TOTP is not enabled".
         if x_device_id:

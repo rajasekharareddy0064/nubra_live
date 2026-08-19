@@ -30,10 +30,10 @@ async def check():
     rows = await conn.fetch(f"""
         SELECT timestamp AT TIME ZONE 'Asia/Kolkata' as ts,
                symbol, expiry, underlying_symbol,
-               ROUND(open::numeric/100.0, 2)   AS open_rs,
-               ROUND(high::numeric/100.0, 2)   AS high_rs,
-               ROUND(low::numeric/100.0, 2)    AS low_rs,
-               ROUND(close::numeric/100.0, 2)  AS close_rs,
+               ROUND(open::numeric, 2)   AS open_rs,
+               ROUND(high::numeric, 2)   AS high_rs,
+               ROUND(low::numeric, 2)    AS low_rs,
+               ROUND(close::numeric, 2)  AS close_rs,
                ROUND(volume::numeric, 0)       AS volume,
                ROUND(oi::numeric, 0)           AS oi
         FROM "{schema}".futures_data
@@ -58,10 +58,10 @@ async def check():
     rows_sf = await conn.fetch(f"""
         SELECT timestamp AT TIME ZONE 'Asia/Kolkata' as ts,
                symbol, underlying_symbol,
-               ROUND(open::numeric/100.0, 2)   AS open_rs,
-               ROUND(high::numeric/100.0, 2)   AS high_rs,
-               ROUND(low::numeric/100.0, 2)    AS low_rs,
-               ROUND(close::numeric/100.0, 2)  AS close_rs,
+               ROUND(open::numeric, 2)   AS open_rs,
+               ROUND(high::numeric, 2)   AS high_rs,
+               ROUND(low::numeric, 2)    AS low_rs,
+               ROUND(close::numeric, 2)  AS close_rs,
                ROUND(volume::numeric, 0)       AS volume,
                ROUND(oi::numeric, 0)           AS oi
         FROM "{schema}".nifty50_stock_futures
